@@ -51,7 +51,7 @@ jobs:
           # pandas/numpy/polars drive the Vane conformance suite; pillow/
           # soundfile/pypdf/av are the multimodal decode libs; pylance powers the
           # vector/FTS retrieval tests; pyiceberg drives the Iceberg read tests.
-          pip install pyarrow cloudpickle pandas numpy polars pillow soundfile pypdf av pylance "pyiceberg[sql-sqlite,pyarrow]"
+          pip install pyarrow cloudpickle pandas numpy polars pillow soundfile pypdf av pylance pytz "pyiceberg[sql-sqlite,pyarrow]"
 
       - name: cargo check
         run: cargo check --lib

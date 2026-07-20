@@ -192,13 +192,19 @@ Lance 的向量索引(IVF 质心 + 分区倒排)可常驻内存 LRU;jude 新增 
 |---|---|---|---|---|
 | resident EXACT 扇出 | — | 100% | 15 ms | 63 |
 | **resident EXACT 批量** | — | 100% | — | **469** |
-| sharded ANN 全分片 | IVF_FLAT/SQ/PQ/HNSW_SQ | 100% | ~170 ms | 5.5-5.9 |
+| sharded ANN 全分片 | IVF_FLAT | 100% | ~19 ms | **52**(修复后;300k/dim768/W4) |
 | routed ANN 探 2/4 | 各索引 | 90.2% | ~93 ms | 14.8 |
 
-**关键理解(回应"分布式为何比单机慢"):**
-- **单条查询延迟**:小数据(能入单机内存)时分片一定更慢 —— 一条查询要 派发W个RPC + 归并,这些**串行协调开销 ~5-6ms 固定**,超过被并发压缩后的每片计算。这是 Amdahl,不是并发不够。**分片的价值是"数据大到单机放不下(十亿级)"**,不是小规模提速。
-- **整体吞吐**:分布式**总是**更高 —— `resident EXACT 批量` 一次 RPC 带整批查询,协调被摊薄,**500k 数据 469 QPS**。这才是"并发高"的正确体现(见 §7.3:1→8 worker 吞吐 5.31×,近线性)。
-- **routed vs sharded**:routed 探测一半分片 = 90% 召回但延迟低 2.6×(93 vs 170ms)—— 正确的"召回换扇出"权衡,是十亿级该用的架构。
+> 注:早期版本这里写的是 5.5 QPS —— 那是修 `distributed_ann_knn`(每查询新建 DuckDB 连接归并 + 分片回传整列向量)**之前**的陈旧数据。修复后单查询 ~52 QPS(300k/dim768/W=4),快约 10 倍。
+
+**关键理解 —— "sharded ANN 为何还慢于 resident-exact":**
+- **不是 ANN 算法差,是"省的计算 < 多的开销"。** resident-exact 是**零开销的内存 BLAS 矩阵乘**;sharded ANN 每分片要走 Lance 查询机器(scanner + IVF 遍历 + 取候选 + 精排),这套固定开销 ~11-19ms。ANN 确实扫得少,但**只有当每分片暴力扫描本身很贵时(净收益 = 省的计算 − 开销 > 0)才赢**。
+- 实测(当前代码):每分片 7.5w(dim768)时 resident 7ms/142 QPS、ANN 18.7ms/52 QPS —— **resident 完胜**,因为 7.5w×768 矩阵乘才几 ms。
+- **crossover 在每分片 ~百万级**:单机已证(§1,`bench_vector_index_wins.py`)1M×768 暴力精确 **798ms/1.3 QPS** vs IVF **~70ms/14 QPS**(ANN **10×**)。sharded ANN 做的正是"每分片 IVF",resident-exact 做的正是"每分片暴力" —— 所以**每分片到 ~1M×768 时 sharded ANN 明显胜出**,这才是十亿级主场。
+- 本机磁盘仅剩 ~6GB(用户盘 96% 满),无法构建"每分片 50w×768"的分片(数据+索引需 ~6GB+,多次 `No space`),故分布式 crossover 未能在本机端到端复现;`benchmarking/bench_vector_sharded_win.py` 可在更大磁盘/集群上复现(用 IVF_SQ 小索引省盘)。
+
+- **整体吞吐**:分布式**总是**更高 —— `resident EXACT 批量` 一次 RPC 带整批查询,协调被摊薄,**500k 数据 469 QPS**(dim768/300k 实测批量达 **1020 QPS**)。这才是"并发高"的正确体现(见 §7.3)。
+- **routed vs sharded**:routed 探测一半分片 = 90% 召回但延迟低 2.6× —— 正确的"召回换扇出"权衡。
 
 **选型:** 小数据要低延迟 → 单机 `knn_ann_resident`(182 QPS);要高吞吐 → `distributed_knn_resident_batch`;数据超单机内存 → `distributed_ann_knn`(全分片,100% 召回)或 `distributed_ann_knn_routed`(路由,省扇出)。
 
