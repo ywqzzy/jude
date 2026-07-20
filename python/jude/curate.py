@@ -120,6 +120,7 @@ __all__ = [
     "substring_dedup",
     "normalize_unicode",
     "fix_encoding",
+    "token_length_filter",
     # cosmos stages
     "ChunkStage",
     "QualityFilterStage",
@@ -800,6 +801,36 @@ def fix_encoding(
     if dst in table.column_names:
         return table.set_column(table.column_names.index(dst), dst, arr)
     return table.append_column(dst, arr)
+
+
+# --- L4.5. tokenizer-aware length gate ---------------------------------------
+
+
+def token_length_filter(
+    table: pa.Table,
+    *,
+    column: str = "text",
+    tokenizer: Any = "bytes",
+    min_tokens: int | None = None,
+    max_tokens: int | None = None,
+    count_column: str | None = None,
+) -> pa.Table:
+    """Filter rows by TOKEN count (not word/char count) — training cares about
+    tokens, so length gates should too (Gopher's ``min_words`` is a proxy). Uses
+    the same pluggable tokenizer as ``jude.tokenize`` (``"bytes"`` by default, any
+    callable, or a named tiktoken/HF tokenizer). If ``count_column`` is set, keep
+    all rows and annotate the token count instead of dropping."""
+    from jude.tokenize import _resolve_tokenizer
+
+    enc, _ = _resolve_tokenizer(tokenizer)
+    counts = [len(enc(t or "")) for t in _col(table, column)]
+    if count_column is not None:
+        return table.append_column(count_column, pa.array(counts, type=pa.int64()))
+    keep = [
+        i for i, c in enumerate(counts)
+        if (min_tokens is None or c >= min_tokens) and (max_tokens is None or c <= max_tokens)
+    ]
+    return table.take(pa.array(keep, type=pa.int64()))
 
 
 # --- cosmos pipeline stages --------------------------------------------------
