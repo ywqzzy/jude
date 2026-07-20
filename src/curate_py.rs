@@ -75,6 +75,8 @@ fn signals_to_dict<'py>(
     d.set_item("dup_line_ratio", s.dup_line_ratio)?;
     d.set_item("hash_line_ratio", s.hash_line_ratio)?;
     d.set_item("top_word_ratio", s.top_word_ratio)?;
+    d.set_item("stopword_ratio", s.stopword_ratio)?;
+    d.set_item("dup_ngram_ratio", s.dup_ngram_ratio)?;
     Ok(d)
 }
 
@@ -112,6 +114,15 @@ fn thresholds_from_kwargs(
         }
         if let Some(v) = kw.get_item("max_top_word_ratio")? {
             t.max_top_word_ratio = v.extract()?;
+        }
+        if let Some(v) = kw.get_item("max_digit_ratio")? {
+            t.max_digit_ratio = v.extract()?;
+        }
+        if let Some(v) = kw.get_item("min_stopword_ratio")? {
+            t.min_stopword_ratio = v.extract()?;
+        }
+        if let Some(v) = kw.get_item("max_dup_ngram_ratio")? {
+            t.max_dup_ngram_ratio = v.extract()?;
         }
     }
     Ok(t)
@@ -338,8 +349,10 @@ fn contamination_coverage_batch(
     texts
         .into_iter()
         .map(|t| {
-            t.map(|s| curate::contamination_coverage(&curate::ngram_hashes(&s, ngram), &example_sets))
-                .unwrap_or(0.0)
+            t.map(|s| {
+                curate::contamination_coverage(&curate::ngram_hashes(&s, ngram), &example_sets)
+            })
+            .unwrap_or(0.0)
         })
         .collect()
 }

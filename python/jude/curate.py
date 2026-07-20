@@ -222,6 +222,8 @@ _QUALITY_FIELDS = [
     ("dup_line_ratio", pa.float64()),
     ("hash_line_ratio", pa.float64()),
     ("top_word_ratio", pa.float64()),
+    ("stopword_ratio", pa.float64()),
+    ("dup_ngram_ratio", pa.float64()),
 ]
 
 

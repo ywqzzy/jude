@@ -754,7 +754,20 @@ pub struct QualitySignals {
     pub hash_line_ratio: f64,
     /// ratio of the most-common word's count to total words (repetition)
     pub top_word_ratio: f64,
+    /// fraction of words that are common English stopwords (real prose has
+    /// stopwords; keyword spam / boilerplate lists do not) — Gopher signal
+    pub stopword_ratio: f64,
+    /// fraction of word 3-grams that are duplicates of an earlier 3-gram
+    /// (1 - unique/total); high = repetitive/templated text — Gopher signal
+    pub dup_ngram_ratio: f64,
 }
+
+/// Small English stopword set for the Gopher stopword gate.
+const EN_STOPWORDS: &[&str] = &[
+    "the", "be", "to", "of", "and", "a", "in", "that", "have", "i", "it", "for", "not", "on",
+    "with", "he", "as", "you", "do", "at", "this", "but", "his", "by", "from", "they", "we", "say",
+    "her", "she", "or", "an", "will", "my", "one", "all", "would", "there", "their",
+];
 
 /// Compute quality signals for one document.
 pub fn quality_signals(text: &str) -> QualitySignals {
@@ -797,6 +810,30 @@ pub fn quality_signals(text: &str) -> QualitySignals {
         }
         let top = freq.values().copied().max().unwrap_or(0);
         sig.top_word_ratio = top as f64 / words.len() as f64;
+
+        // Gopher stopword gate: fraction of words that are common stopwords.
+        let stop: std::collections::HashSet<&str> = EN_STOPWORDS.iter().copied().collect();
+        let sw = words
+            .iter()
+            .filter(|w| {
+                let lw: String = w.chars().flat_map(|c| c.to_lowercase()).collect();
+                stop.contains(lw.as_str())
+            })
+            .count();
+        sig.stopword_ratio = sw as f64 / words.len() as f64;
+
+        // Gopher repetition: duplicate word 3-gram fraction (1 - unique/total).
+        if words.len() >= 3 {
+            let total = words.len() - 2;
+            let mut seen3 = std::collections::HashSet::new();
+            let mut dup3 = 0usize;
+            for w in words.windows(3) {
+                if !seen3.insert((w[0], w[1], w[2])) {
+                    dup3 += 1;
+                }
+            }
+            sig.dup_ngram_ratio = dup3 as f64 / total as f64;
+        }
     }
 
     let lines: Vec<&str> = text.lines().collect();
@@ -831,6 +868,9 @@ pub struct QualityThresholds {
     pub min_alpha_word_ratio: f64,
     pub max_dup_line_ratio: f64,
     pub max_top_word_ratio: f64,
+    pub max_digit_ratio: f64,
+    pub min_stopword_ratio: f64,
+    pub max_dup_ngram_ratio: f64,
 }
 
 impl Default for QualityThresholds {
@@ -845,6 +885,9 @@ impl Default for QualityThresholds {
             min_alpha_word_ratio: 0.60,
             max_dup_line_ratio: 0.30,
             max_top_word_ratio: 0.30,
+            max_digit_ratio: 0.30,
+            min_stopword_ratio: 0.06,
+            max_dup_ngram_ratio: 0.30,
         }
     }
 }
@@ -874,6 +917,17 @@ pub fn quality_reject_reason(sig: &QualitySignals, t: &QualityThresholds) -> Opt
     }
     if sig.top_word_ratio > t.max_top_word_ratio {
         return Some(format!("top_word_ratio_high:{:.2}", sig.top_word_ratio));
+    }
+    if sig.digit_ratio > t.max_digit_ratio {
+        return Some(format!("digit_ratio_high:{:.2}", sig.digit_ratio));
+    }
+    // Gopher stopword gate: only apply to docs with enough words to be prose
+    // (short snippets legitimately have few stopwords).
+    if sig.word_count >= t.min_words && sig.stopword_ratio < t.min_stopword_ratio {
+        return Some(format!("stopword_ratio_low:{:.3}", sig.stopword_ratio));
+    }
+    if sig.dup_ngram_ratio > t.max_dup_ngram_ratio {
+        return Some(format!("dup_ngram_ratio_high:{:.2}", sig.dup_ngram_ratio));
     }
     None
 }
@@ -953,6 +1007,57 @@ mod tests {
         let sig = quality_signals("!@#$ %^&* !@#$ %^&* !@#$ %^&*");
         let reason = quality_reject_reason(&sig, &QualityThresholds::default());
         assert!(reason.is_some(), "symbol spam should be rejected");
+    }
+
+    #[test]
+    fn quality_stopword_gate_and_repetition() {
+        // Gopher signals: a real prose paragraph has stopwords + low repetition.
+        let prose = "the study shows that the results are consistent with the theory \
+                     and the data supports this conclusion for the most part in every case \
+                     that we have examined so far across the many different samples we ran";
+        let s = quality_signals(prose);
+        assert!(
+            s.stopword_ratio > 0.1,
+            "prose should have stopwords: {}",
+            s.stopword_ratio
+        );
+        assert!(
+            s.dup_ngram_ratio < 0.2,
+            "prose isn't repetitive: {}",
+            s.dup_ngram_ratio
+        );
+
+        // keyword-spam list: 60 words, almost no stopwords -> stopword gate fires.
+        let spam = (0..60)
+            .map(|i| format!("keyword{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ss = quality_signals(&spam);
+        let r = quality_reject_reason(&ss, &QualityThresholds::default());
+        assert_eq!(
+            r.as_deref(),
+            Some(&format!("stopword_ratio_low:{:.3}", ss.stopword_ratio)[..])
+        );
+
+        // highly repetitive text -> high dup_ngram_ratio, and it is rejected.
+        let rep = "the cat sat on the mat ".repeat(12);
+        let rs = quality_signals(&rep);
+        assert!(
+            rs.dup_ngram_ratio > 0.5,
+            "repetitive dup_ngram: {}",
+            rs.dup_ngram_ratio
+        );
+        let rr = quality_reject_reason(&rs, &QualityThresholds::default());
+        assert!(rr.is_some(), "repetitive text rejected");
+    }
+
+    #[test]
+    fn quality_digit_gate() {
+        // a 60-"word" doc that is mostly digits -> digit_ratio gate fires.
+        let digits = (0..60).map(|_| "1234567").collect::<Vec<_>>().join(" ");
+        let s = quality_signals(&digits);
+        let r = quality_reject_reason(&s, &QualityThresholds::default());
+        assert!(r.is_some(), "digit-heavy doc should be rejected: {r:?}");
     }
 
     #[test]
@@ -1227,8 +1332,14 @@ mod tests {
         let dn = ngram_hashes(&long_doc, 3);
         let ratio = contamination_ratio(&dn, &example[0].iter().copied().collect());
         let cov = contamination_coverage(&dn, &example);
-        assert!(ratio < 0.2, "diluted doc-side ratio should be small: {ratio}");
-        assert!(cov > 0.9, "coverage should catch the buried question: {cov}");
+        assert!(
+            ratio < 0.2,
+            "diluted doc-side ratio should be small: {ratio}"
+        );
+        assert!(
+            cov > 0.9,
+            "coverage should catch the buried question: {cov}"
+        );
         // an unrelated long doc -> coverage ~0
         let clean = "rust systems programming ".repeat(50);
         assert!(contamination_coverage(&ngram_hashes(&clean, 3), &example) < 0.05);
