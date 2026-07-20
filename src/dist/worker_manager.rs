@@ -177,6 +177,33 @@ impl WorkerManager {
             .max(1)
     }
 
+    /// Size-aware split assignment (E3): assign each split (e.g. a data file /
+    /// fragment of the given byte size) to a worker so total bytes are balanced,
+    /// instead of the even round-robin of `worker_for`. Worst-fit bin-packing —
+    /// splits are placed largest-first onto the currently least-loaded worker.
+    /// Returns the worker index per split IN THE INPUT ORDER. This is where the
+    /// scheduling "brain" (size-balanced placement) moves from Python into Rust.
+    fn assign_by_size(&self, sizes: Vec<u64>) -> Vec<usize> {
+        let w = self.num_workers.max(1);
+        let mut load = vec![0u64; w];
+        let mut out = vec![0usize; sizes.len()];
+        // process largest splits first (worst-fit decreasing) for a better balance
+        let mut order: Vec<usize> = (0..sizes.len()).collect();
+        order.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]));
+        for idx in order {
+            // pick the least-loaded worker (ties -> lowest index for determinism)
+            let mut best = 0usize;
+            for k in 1..w {
+                if load[k] < load[best] {
+                    best = k;
+                }
+            }
+            out[idx] = best;
+            load[best] += sizes[idx];
+        }
+        out
+    }
+
     /// Worker assignment per bucket for a hash-shuffle join: element `i` is the
     /// worker index that should join bucket `i`. Driven through the ported
     /// `HashSplitAssigner` so the routing decision lives in the Rust assigner,
@@ -317,6 +344,42 @@ mod tests {
         assert_eq!(workers.len(), 6);
         // buckets 0..6 round-robin over 4 workers.
         assert_eq!(workers, vec![0, 1, 2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn assign_by_size_balances_bytes() {
+        let m = mgr(3, true, 0, 4 * 1024 * 1024, 0);
+        // 6 files of decreasing size; worst-fit-decreasing should balance load.
+        let sizes = vec![100, 90, 80, 70, 60, 50];
+        let a = m.assign_by_size(sizes.clone());
+        assert_eq!(a.len(), 6);
+        assert!(a.iter().all(|&w| w < 3));
+        // per-worker totals are near-balanced (max-min small vs even round-robin)
+        let mut load = [0u64; 3];
+        for (i, &w) in a.iter().enumerate() {
+            load[w] += sizes[i];
+        }
+        let (mx, mn) = (*load.iter().max().unwrap(), *load.iter().min().unwrap());
+        assert!(mx - mn <= 30, "load imbalance {load:?}");
+    }
+
+    #[test]
+    fn assign_by_size_one_giant_file_isolated() {
+        let m = mgr(2, true, 0, 4 * 1024 * 1024, 0);
+        // one huge file + many tiny ones: the huge file gets its own worker.
+        let mut sizes = vec![1000u64];
+        sizes.extend(std::iter::repeat(1).take(10));
+        let a = m.assign_by_size(sizes.clone());
+        let giant_worker = a[0];
+        // the other worker soaks up all the tiny files
+        let other: u64 = (1..sizes.len())
+            .filter(|&i| a[i] != giant_worker)
+            .map(|i| sizes[i])
+            .sum();
+        assert_eq!(
+            other, 10,
+            "tiny files should pile on the non-giant worker: {a:?}"
+        );
     }
 
     #[test]

@@ -411,15 +411,38 @@ class RayRunner(Runner):
                       "json": f"read_json_auto([{lst}])"}[kind]
             return con.sql(f"SELECT {proj} FROM {reader}{filt}").to_arrow()
 
-        # shard units across workers (routing decided by the Rust WorkerManager)
+        # shard units across workers (routing decided by the Rust WorkerManager).
         workers = self._ensure_workers()
-        n = min(len(units), max(1, self.num_workers))
-        step = (len(units) + n - 1) // n
-        groups = [units[i : i + step] for i in range(0, len(units), step)]
-        submit = [
-            (lambda i=i, grp=grp: workers[self.mgr.worker_for(i)].read_scan.remote(kind, spec_of(grp), opts))
-            for i, grp in enumerate(groups)
-        ]
+        if kind != "lance":
+            # size-aware assignment (E3): balance total bytes per worker via the
+            # Rust worst-fit bin-packer instead of an even file-count split — one
+            # big file no longer makes its worker the straggler.
+            import os
+
+            sizes = []
+            for u in units:
+                try:
+                    sizes.append(os.path.getsize(u))
+                except OSError:
+                    sizes.append(0)
+            assign = self.mgr.assign_by_size(sizes)  # worker index per file
+            by_worker: dict[int, list] = {}
+            for u, w in zip(units, assign):
+                by_worker.setdefault(w, []).append(u)
+            plan = list(by_worker.items())  # [(worker_idx, [files])]
+            submit = [
+                (lambda w=w, grp=grp: workers[w].read_scan.remote(kind, spec_of(grp), opts))
+                for w, grp in plan
+            ]
+            groups = [grp for _, grp in plan]
+        else:
+            n = min(len(units), max(1, self.num_workers))
+            step = (len(units) + n - 1) // n
+            groups = [units[i : i + step] for i in range(0, len(units), step)]
+            submit = [
+                (lambda i=i, grp=grp: workers[self.mgr.worker_for(i)].read_scan.remote(kind, spec_of(grp), opts))
+                for i, grp in enumerate(groups)
+            ]
         parts = [t for t in self._dispatch_bounded(submit) if t is not None and t.num_rows > 0]
         if not parts:
             return shim.get([workers[0].read_scan.remote(kind, spec_of(groups[0]), opts)])[0]
