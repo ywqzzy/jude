@@ -359,13 +359,113 @@ class _JudeWorker:
             raise ValueError(f"unknown curate op {op!r}")
         return _realign(fn(_realign(table), **kwargs))
 
+    def curate_minhash_edges(self, table: "pa.Table", column: str, num_hashes: int,
+                             ngram: int, bands: int, seed: int, num_buckets: int,
+                             row_offset: int) -> list:
+        """Producer side of distributed fuzzy dedup (recall-correct). Compute
+        MinHash signatures for this shard, then route each row to a bucket for
+        EACH of its LSH band keys (not just the first) — so two near-dups that
+        share ANY band always co-locate in at least one bucket, matching
+        single-node LSH recall. Only the lightweight (global row id, band key,
+        signature) travels through the shuffle, never the full row.
+
+        Global row id ``_rid = row_offset + local_index`` is stable across the
+        whole corpus (the driver slices the table in order), so the driver can
+        union-find edges across buckets and filter the original table by id.
+        Returns ``num_buckets`` tables with columns (_rid, _bandkey, _sig)."""
+        import pyarrow as pa
+        from jude.jude import _curate
+
+        t = _realign(table)
+        texts = t.column(column).to_pylist()
+        sigs = _curate.minhash_signature_batch(texts, num_hashes, ngram, seed)
+        band_keys = _curate.lsh_band_keys_batch(sigs, bands)
+        rid_b: list[list[int]] = [[] for _ in range(num_buckets)]
+        key_b: list[list[str]] = [[] for _ in range(num_buckets)]
+        sig_b: list[list] = [[] for _ in range(num_buckets)]
+        for i, keys in enumerate(band_keys):
+            rid = row_offset + i
+            seen_bkt: set = set()  # a row lands once per bucket even if two bands collide
+            ks = keys if keys else [f"_row{rid}"]  # empty text -> own singleton bucket
+            for key in ks:
+                bkt = _det_hash(key) % num_buckets
+                if (bkt, key) in seen_bkt:
+                    continue
+                seen_bkt.add((bkt, key))
+                rid_b[bkt].append(rid)
+                key_b[bkt].append(key)
+                sig_b[bkt].append(sigs[i])
+        out = []
+        for bkt in range(num_buckets):
+            out.append(pa.table({
+                "_rid": pa.array(rid_b[bkt], type=pa.int64()),
+                "_bandkey": pa.array(key_b[bkt], type=pa.string()),
+                "_sig": pa.array(sig_b[bkt], type=pa.list_(pa.uint64())),
+            }))
+        return out if num_buckets > 1 else out[0]
+
+    def curate_fuzzy_edges_bucket(self, shard_refs: list, threshold: float) -> "pa.Table":
+        """Reducer side of distributed fuzzy dedup: gather a bucket's
+        (_rid, _bandkey, _sig) rows, group by exact band key (LSH candidates),
+        verify each candidate pair by MinHash Jaccard >= threshold, and emit the
+        surviving near-dup EDGES as (a, b) global-row-id pairs. Cross-bucket
+        merging into clusters is the DRIVER's job (global union-find) — that's
+        what makes the result match single-node fuzzy_dedup instead of only
+        deduping within a bucket."""
+        import pyarrow as pa
+        from jude.jude import _curate
+
+        shards = [t for t in ray.get(shard_refs) if t is not None and t.num_rows > 0]
+        empty = pa.table({"a": pa.array([], type=pa.int64()), "b": pa.array([], type=pa.int64())})
+        if not shards:
+            return empty
+        merged = _realign(pa.concat_tables(shards))
+        rids = merged.column("_rid").to_pylist()
+        keys = merged.column("_bandkey").to_pylist()
+        sigs = merged.column("_sig").to_pylist()
+        # group row-indices by band key: only rows sharing a band are candidates
+        by_key: dict[str, list[int]] = {}
+        for i, key in enumerate(keys):
+            by_key.setdefault(key, []).append(i)
+        edges: set = set()
+        for members in by_key.values():
+            if len(members) < 2:
+                continue
+            # collapse identical signatures inside the group before the O(m^2)
+            # verify (a template-spam band can be huge otherwise).
+            leaders: dict[tuple, int] = {}
+            uniq: list[int] = []
+            for idx in members:
+                sk = tuple(sigs[idx])
+                if sk in leaders:
+                    a, b = rids[leaders[sk]], rids[idx]
+                    if a != b:
+                        edges.add((min(a, b), max(a, b)))  # identical -> definitely dup
+                else:
+                    leaders[sk] = idx
+                    uniq.append(idx)
+            for x in range(len(uniq)):
+                for y in range(x + 1, len(uniq)):
+                    if _curate.signature_similarity(sigs[uniq[x]], sigs[uniq[y]]) >= threshold:
+                        a, b = rids[uniq[x]], rids[uniq[y]]
+                        edges.add((min(a, b), max(a, b)))
+        if not edges:
+            return empty
+        aa = [e[0] for e in edges]
+        bb = [e[1] for e in edges]
+        return pa.table({"a": pa.array(aa, type=pa.int64()), "b": pa.array(bb, type=pa.int64())})
+
     def curate_minhash_bucketize(self, table: "pa.Table", column: str, num_hashes: int,
                                  ngram: int, bands: int, seed: int, num_buckets: int) -> list:
         """Producer side of distributed fuzzy dedup: compute MinHash signatures
         for this shard, then route each row to one of `num_buckets` output shards
         by its FIRST LSH band key (so near-dup candidates co-locate). Returns a
         list of `num_buckets` tables, each carrying the row + its signature (as a
-        list<uint64>) + a stable global-ish key column `_rid` (hash of row)."""
+        list<uint64>) + a stable global-ish key column `_rid` (hash of row).
+
+        DEPRECATED for recall (first-band-only routing misses near-dups sharing a
+        later band); dist_fuzzy_dedup now uses curate_minhash_edges. Kept for any
+        external caller."""
         import pyarrow as pa
         from jude.jude import _curate
 

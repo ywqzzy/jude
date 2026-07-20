@@ -148,18 +148,20 @@ def dist_fuzzy_dedup(
     num_hashes: int = 128, ngram: int = 2, bands: int = 16, seed: int = 1,
     keep_cluster: bool = False, runner: Any = None,
 ) -> pa.Table:
-    """Distributed MinHash-LSH fuzzy dedup: each shard computes MinHash
-    signatures and routes rows to buckets by LSH band key (near-dup candidates
-    co-locate); each reducer verifies pairs by Jaccard>=threshold, union-finds a
-    cluster, keeps one per cluster. Approximates curate.fuzzy_dedup at scale.
+    """Distributed MinHash-LSH fuzzy dedup, recall-matched to single-node.
 
-    NOTE: bucketing by the first band key means near-dups that only share a
-    *later* band may land in different buckets (LSH recall trade-off). Increase
-    `bands` for higher recall. For exact single-node semantics use
-    curate.fuzzy_dedup.
+    Each shard computes MinHash signatures and routes every row to a bucket for
+    EACH of its LSH band keys (near-dups sharing ANY band co-locate — not just
+    the first band). Each reducer verifies candidate pairs by Jaccard>=threshold
+    and emits near-dup EDGES; the driver runs ONE global union-find over all
+    edges so clusters that span buckets (A~B in one bucket, B~C in another) merge
+    correctly, then keeps one row per cluster. This matches ``curate.fuzzy_dedup``
+    semantics at scale (the old first-band routing silently lost recall). Only
+    (row-id, band-key, signature) is shuffled, never the full row.
     """
     from jude.runners import _ray_shim as shim
     import jude
+    from jude.jude import _curate
 
     r = _runner(runner)
     con = jude.connect()
@@ -167,23 +169,43 @@ def dist_fuzzy_dedup(
     workers = r._ensure_workers()
     b = r.mgr.shuffle_bucket_count(None)
     bucket_workers = r.mgr.shuffle_bucket_workers(None)
+    # global row-id offsets: parts are in-order slices of `table`, so row
+    # (offset[p] + i) of the corpus is row i of part p — lets the driver map
+    # edges back to original rows.
+    offsets: list[int] = []
+    acc = 0
+    for part in parts:
+        offsets.append(acc)
+        acc += part.num_rows
     refs = [
-        workers[r.mgr.worker_for(i)].curate_minhash_bucketize.options(num_returns=b).remote(
-            part, column, num_hashes, ngram, bands, seed, b
+        workers[r.mgr.worker_for(i)].curate_minhash_edges.options(num_returns=b).remote(
+            part, column, num_hashes, ngram, bands, seed, b, offsets[i]
         )
         for i, part in enumerate(parts)
     ]
     refs = [x if isinstance(x, list) else [x] for x in refs]
-    out = [
-        workers[bucket_workers[bkt]].curate_fuzzy_dedup_bucket.remote(
-            [refs[p][bkt] for p in range(len(parts))], threshold, keep_cluster
+    edge_refs = [
+        workers[bucket_workers[bkt]].curate_fuzzy_edges_bucket.remote(
+            [refs[p][bkt] for p in range(len(parts))], threshold
         )
         for bkt in range(b)
     ]
-    tables = [t for t in shim.get(out) if t is not None and t.num_rows > 0]
-    if not tables:
-        return table.slice(0, 0)
-    return pa.concat_tables(tables).combine_chunks()
+    n = table.num_rows
+    pairs: list = []
+    for et in shim.get(edge_refs):
+        if et is None or et.num_rows == 0:
+            continue
+        aa = et.column("a").to_pylist()
+        bb = et.column("b").to_pylist()
+        pairs.extend(zip(aa, bb))
+    # one global connected-components over the whole corpus's near-dup graph
+    reps = _curate.connected_components(n, pairs)
+    if keep_cluster:
+        return table.append_column("dup_cluster", pa.array(reps, type=pa.int64())).combine_chunks()
+    keep = [i for i in range(n) if reps[i] == i]
+    if len(keep) == n:
+        return table
+    return table.take(pa.array(keep, type=pa.int64())).combine_chunks()
 
 
 # --- C9. distributed global shuffle + blend ---------------------------------
