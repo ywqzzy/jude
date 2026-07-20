@@ -530,12 +530,12 @@ class RelationPipeline:
         """Run on cosmos-xenna: each stage a StageSpec, shards as input_data."""
         for stage in self._stages:
             _pickle_by_value(stage)
-        # A user-supplied PipelineConfig (e.g. raised monitoring_verbosity_level)
-        # wins; otherwise jude's default finite-batch config.
-        cfg = self.pipeline_config or jp.PipelineConfig(
-            execution_mode=jp.ExecutionMode.BATCH,
-            return_last_stage_outputs=True,
-        )
+        # A user-supplied PipelineConfig wins; otherwise jude's default enables
+        # cosmos-xenna's built-in FAULT TOLERANCE (X.1): retry failed stage tasks
+        # and actor setup, and rebuild workers that die — so one flaky/dead node
+        # doesn't abort a long PB-scale map pipeline. cosmos owns FT for the
+        # map-stage path; jude's own shuffle ops use Ray lineage + actor restarts.
+        cfg = self.pipeline_config or self._default_cosmos_config()
         spec = jp.PipelineSpec(
             input_data=list(shards),
             stages=[jp.StageSpec(s) for s in self._stages],
@@ -543,3 +543,22 @@ class RelationPipeline:
         )
         out = jp.run_pipeline(spec)
         return list(out or [])
+
+    @staticmethod
+    def _default_cosmos_config() -> Any:
+        """cosmos PipelineConfig with fault-tolerance defaults turned on (retries +
+        worker rebuild). Only sets FT knobs the installed cosmos-xenna actually
+        supports (older versions may lack some), falling back gracefully."""
+        import os
+
+        base: dict = {"execution_mode": jp.ExecutionMode.BATCH, "return_last_stage_outputs": True}
+        ft = {
+            "num_run_attempts_python": int(os.environ.get("JUDE_COSMOS_RUN_ATTEMPTS", "3")),
+            "num_setup_attempts_python": int(os.environ.get("JUDE_COSMOS_SETUP_ATTEMPTS", "3")),
+            "reset_workers_on_failure": True,
+        }
+        try:
+            return jp.PipelineConfig(**base, **ft)
+        except TypeError:
+            # installed cosmos-xenna doesn't expose these knobs — keep the base.
+            return jp.PipelineConfig(**base)

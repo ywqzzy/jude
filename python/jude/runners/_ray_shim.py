@@ -883,7 +883,23 @@ def cluster_nodes() -> "list[tuple[str, float, float, int]]":
 
 
 def make_workers(n: int, num_gpus_per_worker: int = 0) -> list:
-    opts: dict[str, Any] = {}
+    # Fault tolerance (X.1): a _JudeWorker holds only REBUILDABLE state (a stock
+    # DuckDB connection + version-stamped caches), so `max_restarts` lets Ray
+    # bring a dead actor back and keep the POOL alive across node failures — this
+    # is always safe.
+    #
+    # `max_task_retries` is DIFFERENT: it re-runs an in-flight task on the
+    # restarted actor after a node death. That's safe for jude's pure query/read
+    # tasks (a SELECT/agg over an immutable input ObjectRef is idempotent) but
+    # NOT for the side-effecting WRITE tasks (write_lance_fragment /
+    # write_parquet_file). Ray applies max_task_retries actor-wide, so we default
+    # it to 0 (don't auto-re-run in-flight tasks) — conservative/correct. A
+    # read-only pipeline can opt in via JUDE_ACTOR_MAX_TASK_RETRIES.
+    # (Note: Ray never retries on an application error — only on actor/node death.)
+    opts: dict[str, Any] = {
+        "max_restarts": int(os.environ.get("JUDE_ACTOR_MAX_RESTARTS", "3")),
+        "max_task_retries": int(os.environ.get("JUDE_ACTOR_MAX_TASK_RETRIES", "0")),
+    }
     if num_gpus_per_worker > 0:
         opts["num_gpus"] = num_gpus_per_worker
     return [_JudeWorker.options(**opts).remote(num_gpus=num_gpus_per_worker) for _ in range(n)]

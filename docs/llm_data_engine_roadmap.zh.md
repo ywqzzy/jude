@@ -166,10 +166,12 @@ compute-heavy kernel 在 Rust（`curate`）；模型只作为 stage 内容由用
   `worker_restart_interval_m`/`worker_max_lifetime_m`、`enable_work_stealing`(负载再均衡)。
   → **FT-critical 的长 map 作业跑 cosmos 引擎，容错几乎白得**（NVIDIA 就是拿它做 PB 级多模态 curation 的）。
 
-  **(b) shuffle 路径（jude 自己的 RayRunner：全局 dedup / join / group-by）→ Ray lineage + actor 重启。**
-  这些是自定义 all-to-all shuffle，不是 cosmos stage，cosmos 不管。用 Ray 内建：`_JudeWorker` 配
-  `max_restarts`+`max_task_retries`（状态只有可重建缓存）、task 带 `max_retries`、确定性审计（已满足）、
-  源读 durable + 可选 shuffle 边界 `write_lance` 粗物化。
+  **(b) shuffle 路径（jude 自己的 RayRunner：全局 dedup / join / group-by）→ Ray actor 重启（不盲目重试）。**
+  这些是自定义 all-to-all shuffle，不是 cosmos stage。`_JudeWorker` 配 **`max_restarts`**（死了重建，保住整个池——
+  状态只有可重建缓存，永远安全）；**`max_task_retries` 默认 0**（不自动重跑在途 task）——因为 Ray 的 task 重试是
+  actor-wide 的，纯查询/读 task 幂等（对不可变输入的 SELECT/agg 重跑结果一致）可重试，但**写 task（write_lance_fragment/
+  write_parquet_file）有副作用不能盲目重跑**；只读管线可 `JUDE_ACTOR_MAX_TASK_RETRIES>0` 显式开。
+  （注：Ray 只在 actor/节点死时重试，application error 从不重试。）源读 durable + 可选 shuffle 边界 `write_lance` 粗物化。
 
   **流式/pipelined 生成器路径不做 FT**（中途死了丢位置）——FT-critical 走 (a) cosmos 或 (b) stage-based。
   *测试：cosmos 路径注入 stage 异常验证 `ignore_failures`/重试；shuffle 路径 `ray.cluster_utils` 杀 worker 验证 actor 重启 + lineage 重算，结果与无故障一致。*
