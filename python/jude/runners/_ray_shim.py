@@ -494,8 +494,27 @@ class _JudeWorker:
                 else:
                     leaders[sk] = idx
                     uniq.append(idx)
-            for x in range(len(uniq)):
-                for y in range(x + 1, len(uniq)):
+            m = len(uniq)
+            # B5: a HOT band (many distinct-but-similar docs sharing a band key)
+            # would blow up the O(m^2) all-pairs verify. Above a cap, verify each
+            # member against a bounded set of representatives instead — O(m*reps),
+            # still linking the near-dup cluster (connected-components merges it),
+            # at the cost of possibly missing a pair similar to a non-rep only.
+            _HOT_CAP, _REPS = 2000, 64
+            if m > _HOT_CAP:
+                reps = uniq[:_REPS]
+                for x in range(m):
+                    ix = uniq[x]
+                    for r in reps:
+                        if ix == r:
+                            continue
+                        if _curate.signature_similarity(sigs[ix], sigs[r]) >= threshold:
+                            a, b = rids[ix], rids[r]
+                            edges.add((min(a, b), max(a, b)))
+                            break
+                continue
+            for x in range(m):
+                for y in range(x + 1, m):
                     if _curate.signature_similarity(sigs[uniq[x]], sigs[uniq[y]]) >= threshold:
                         a, b = rids[uniq[x]], rids[uniq[y]]
                         edges.add((min(a, b), max(a, b)))

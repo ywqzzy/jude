@@ -19,7 +19,7 @@
 - 🔧 **B2 最终归并单点** → 部分修:GROUP BY 的**最终归并现在分布式**——两阶段的 partial 结果按 group key 哈希 shuffle 到各 bucket worker,每桶跑 final_sql 再 concat(`distributed_aggregate(group_keys=)` + DAG 路径同改),高基数 GROUP BY 不再把每个 group 汇到 driver/worker0。全局聚合(无 group key,单行结果)仍单点归并(无需分布)。测试 `test_distributed_groupby_merge.py`(3:高基数 == 单机、每 group 恰一次、STDDEV 精确)。待办:全局 ORDER BY 仍在 worker0 归并(range-partition 排序未做)。
 - 🔧 **B3 非可分解聚合** → 已修:`STDDEV/VARIANCE`(pop+samp)现在走**精确两阶段**(count/sum/sum²,实测与单机 0 误差);`MEDIAN/QUANTILE/COUNT(DISTINCT)/STRING_AGG` 等标记 `NotDecomposable` → **优雅 fallback 单机**(不再 `ValueError` 烧重试)。(`_agg.py` + `ray.py` `_collect_once`)待办:COUNT(DISTINCT) shuffle 精确化、分位数走可合并 t-digest sketch。
 - 🔧 **B4 shuffle 无 skew 处理**(spill 按用户要求不做)→ 已修:`distributed_join`(inner + 单 key)加**加盐倾斜连接**——检测重击 key(左侧计数 > 均分的 ~4x),把热 key 的左行随机撒到所有桶、右行复制到每个桶,单个热 key 不再压垮一个 reducer;无热 key 时零开销(`_salt_skewed_inner` 返回 None 走原路径)。与单机 join 结果逐行一致。测试 `test_skew_join.py`(3:倾斜下 == 单机、热 key 跨桶扩散、无倾斜不加盐)。待办:streaming/DAG join 路径接入同一加盐(collect 默认走 streaming)。
-- ⬜ **B5 fuzzy dedup 热 band 单 worker 全量物化 + O(m²)**(`_ray_shim.py:437,459-462`)→ 真实模板页必 OOM。
+- 🔧 **B5 fuzzy dedup 热 band O(m²)** → 已修:reducer 先折叠完全相同签名(便宜),再对"去重后仍 > 2000 个 distinct 签名"的**热 band** 改为**每成员只与有界代表集(前 64 个)比对**(O(m·reps) 而非 O(m²)),连通分量在 driver 合簇——桶内热 band 不再 OER。正常规模走全 pairwise(A3 parity 测试守护)。热路径为病态规模安全阀(>2000,单测太重,靠构造+审查)。
 
 ## 🟡 C. LLM 数据引擎能力缺口(最贴定位,深耕方向)
 
