@@ -91,3 +91,37 @@ def test_hybrid_analytical_vector_then_filter_aggregate():
     d = out.to_pydict()
     assert set(d["cat"]).issubset({0, 2})   # WHERE filter applied
     assert sum(d["n"]) > 0                  # got candidates through the analytics
+
+
+def test_lance_scan_pushdown_registers_relation():
+    n, d = 20000, 16
+    v, _ = _clustered(n, d)
+    cat = (np.arange(n) % 4)
+    path = tempfile.mkdtemp(prefix="jude_ls_") + "/ds"
+    jude._lance.write(_tbl(v, np.arange(n), {"cat": pa.array(cat.tolist())}), path, mode="create")
+    con = jude.connect()
+    # column projection + predicate pushed into Lance; streamed into DuckDB SQL
+    retrieval.lance_scan(con, path, "ds", columns=["id", "cat"], where="cat = 2")
+    out = con.sql("SELECT count(*) n, min(cat) c, max(cat) x FROM ds").to_arrow().to_pydict()
+    assert out["n"] == [n // 4]
+    assert out["c"] == [2] and out["x"] == [2]
+
+
+def test_register_search_index_backed_then_sql():
+    n, d = 20000, 32
+    v, c = _clustered(n, d)
+    cat = (np.arange(n) % 4)
+    path = tempfile.mkdtemp(prefix="jude_rs_") + "/ds"
+    jude._lance.write(_tbl(v, np.arange(n), {"cat": pa.array(cat.tolist())}), path, mode="create")
+    jude.connect().create_lance_vector_index(path, "v", index_type="IVF_FLAT",
+                                              metric="cosine", num_partitions=64)
+    con = jude.connect()
+    # index-backed top-k registered as a relation, then aggregated in SQL
+    retrieval.register_search(con, path, c[3].tolist(), "hits", column="v", k=300, nprobes=16)
+    out = con.sql("SELECT count(*) n FROM hits").to_arrow().to_pydict()
+    assert out["n"][0] > 0 and out["n"][0] <= 300
+    # filtered ANN via pushed-down where
+    retrieval.register_search(con, path, c[3].tolist(), "hf", column="v", k=300,
+                              nprobes=16, where="cat = 1")
+    cats = con.sql("SELECT DISTINCT cat FROM hf").to_arrow().to_pydict()["cat"]
+    assert cats == [1]

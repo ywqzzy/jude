@@ -20,7 +20,7 @@ from typing import Any, Callable, Mapping, Union
 
 import pyarrow as pa
 
-__all__ = ["search_then_sql", "hybrid_analytical"]
+__all__ = ["search_then_sql", "hybrid_analytical", "lance_scan", "register_search", "register_fts"]
 
 _Candidate = Union[pa.Table, Callable[[], Any]]
 
@@ -134,3 +134,94 @@ def hybrid_analytical(
         return _lance.full_text_search(path, text_column, text_query, k=k)
 
     return search_then_sql(con, sql, {name: _retrieve})
+
+
+# --- register Lance scans/searches AS DuckDB relations (one-SQL form) ---------
+# These implement the design doc's P1 (lance_scan) + P2 (jude_search/jude_fts) for
+# jude's pylance stack: a Lance scanner (column + predicate pushdown, and for
+# search the IVF/FTS INDEX via nearest/full_text_query) is streamed as an Arrow
+# RecordBatchReader that DuckDB scans lazily via con.register — so a single SQL
+# string can join/aggregate/filter over a lazily-scanned or index-retrieved Lance
+# relation, with the analytics fused in DuckDB's optimizer. (A pure-Rust
+# lance_scan table function would need the Rust `lance` crate — a heavy, arrow-
+# incompatible dep; the pylance-backed reader is the right fit and needs no fork.)
+
+
+def lance_scan(
+    con: Any,
+    path: str,
+    name: str = "lance",
+    *,
+    columns: Any = None,
+    where: str | None = None,
+    limit: int | None = None,
+) -> str:
+    """Register a Lance dataset as a lazily-scanned DuckDB relation ``name``.
+    Column projection (``columns``) and the predicate (``where``) are pushed down
+    into Lance's scanner — only the needed columns/rows are read and *streamed*
+    into DuckDB (not fully materialized). Afterwards ``SELECT ... FROM {name}``
+    joins/aggregates it in DuckDB. Returns ``name``.
+    """
+    from jude import _lance
+
+    ds = _lance.dataset_cached(path)
+    reader = ds.scanner(columns=columns, filter=where, limit=limit).to_reader()
+    con.register(name, reader)
+    return name
+
+
+def register_search(
+    con: Any,
+    path: str,
+    query: list[float],
+    name: str = "hits",
+    *,
+    column: str = "v",
+    k: int = 100,
+    nprobes: int | None = None,
+    where: str | None = None,
+    columns: Any = None,
+) -> str:
+    """Register the top-``k`` **index-backed** vector search over a Lance dataset
+    as DuckDB relation ``name`` (uses the IVF index via Lance ``nearest``; streamed,
+    adds a ``_distance`` column). ``where`` is pushed down as a pre-filter (filtered
+    ANN). One SQL can then retrieve-and-analyze:
+
+    >>> retrieval.register_search(con, "docs.lance", qv, "hits", k=500, where="year>=2023")
+    >>> con.sql("SELECT author, count(*) FROM hits GROUP BY author").to_arrow()
+    """
+    from jude import _lance
+
+    ds = _lance.dataset_cached(path)
+    nearest = {"column": column, "q": [float(x) for x in query], "k": int(k)}
+    if nprobes is not None:
+        nearest["nprobes"] = int(nprobes)
+    kw: dict = {"columns": columns, "nearest": nearest}
+    if where:
+        kw["filter"] = where
+        kw["prefilter"] = True
+    con.register(name, ds.scanner(**kw).to_reader())
+    return name
+
+
+def register_fts(
+    con: Any,
+    path: str,
+    query: str,
+    name: str = "hits",
+    *,
+    column: str = "text",
+    k: int = 100,
+    columns: Any = None,
+) -> str:
+    """Register the top-``k`` **index-backed** BM25 full-text search over a Lance
+    dataset (INVERTED index) as DuckDB relation ``name`` (streamed, adds a
+    ``_score`` column), so one SQL can retrieve-and-analyze the keyword hits."""
+    from jude import _lance
+
+    ds = _lance.dataset_cached(path)
+    reader = ds.scanner(columns=columns, limit=int(k),
+                        full_text_query={"query": str(query), "columns": [column]}).to_reader()
+    con.register(name, reader)
+    return name
+

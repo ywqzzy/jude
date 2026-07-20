@@ -78,9 +78,10 @@ query ──┤   ...（每分片一个,Rust 调度路由;向量可簇路由,只
 ## 6. 分期
 
 - **P0(✅ 已实现,`jude.retrieval`)**:形态 B —— `retrieval.search_then_sql(con, sql, candidates=...)` 把检索结果(`vector.*` / `distributed_*` / FTS)注册为命名关系,再跑引用它的 SQL;`retrieval.hybrid_analytical(con, path, sql, vector_query=/text_query=, ...)` 是常见 RAG-分析场景的便捷封装(单机走 `knn_rerank` 带 payload 列,分布式走分片检索)。检索与 join/聚合/过滤在一个 DuckDB 计划里融合。
-- **P1**:`lance_scan(path)` table function + 投影/谓词下推(把 `read_lance` 从"全量物化"升级为"流式 + 下推")。
-- **P2**:`jude_search`/`jude_fts` table function(一条 SQL 完成两段式)。
-- **P3**:分布式混合查询把阶段 2 接入 stage-DAG(候选表作为 shuffle 输入),支持大维表分布式 join/聚合。
+- **P1(✅ 已实现,`retrieval.lance_scan`)**:把 Lance 数据集注册成 DuckDB 可**惰性扫描**的关系 —— 列投影 + 谓词下推交给 Lance scanner,只读需要的列/行,以 Arrow `RecordBatchReader` **流式**进 DuckDB(`con.register` 直接扫流,不全量物化)。之后 `SELECT ... FROM ds JOIN ...` 在 DuckDB 里做分析。
+  > 实现路径说明:**没有引入 Rust `lance` crate**(它是重依赖、且自带的 arrow 版本与 jude 的 arrow 58 不兼容,得走 FFI 桥接)。jude 用 pylance,`con.register` 能直接惰性扫描一个 Arrow `RecordBatchReader` —— 所以 pylance scanner(下推)→ reader → DuckDB 才是贴合本栈的正确实现,零 fork、零重依赖。
+- **P2(✅ 已实现,`retrieval.register_search` / `register_fts`)**:一条 SQL 完成"检索 + 分析" —— `register_search` 用 Lance **IVF 索引**(scanner `nearest=`)出 top-k 并带 `_distance`,`where` 作为 **prefilter 下推**(带过滤 ANN);`register_fts` 用 **倒排索引**(`full_text_query`)出 BM25 top-k 带 `_score`。都以流式 reader 注册成 DuckDB 关系,`SELECT ... FROM hits JOIN 维表 GROUP BY ...` 直接融合分析。
+- **P3**:分布式阶段 2 —— 检索候选/`lance_scan` 关系可作为 `runner.collect(con.sql(...))` 的输入,由现有 stage-DAG(shuffle-join / 两阶段聚合)分布式执行;分布式检索本身已由 `distributed_ann_knn(_routed)` / `distributed_fts` / `distributed_hybrid` 覆盖。
 
 ## 7. 诚实的边界
 
