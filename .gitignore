@@ -1,0 +1,14 @@
+/target
+target/
+*.so
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.VSCodeCounter/
+.codeflicker/
+# Python build artifacts at the repo root only — must NOT match src/dist/ (the
+# Rust distributed engine).
+/dist/
+build/
+*.egg-info/

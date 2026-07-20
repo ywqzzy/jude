@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (don't burn CI on stale pushes).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege for a public repo.
+permissions:
+  contents: read
+
+jobs:
+  # ---- required gate: the extension builds and the aligned test suite passes ----
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python build + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin pytest
+          # Runtime + test deps: pyarrow/cloudpickle are declared deps;
+          # pandas/numpy/polars drive the Vane conformance suite; pillow/
+          # soundfile/pypdf/av are the multimodal decode libs; pylance powers the
+          # vector/FTS retrieval tests; pyiceberg drives the Iceberg read tests.
+          pip install pyarrow cloudpickle pandas numpy polars pillow soundfile pypdf av pylance "pyiceberg[sql-sqlite,pyarrow]"
+
+      - name: cargo check
+        run: cargo check --lib
+
+      - name: Build extension (maturin develop)
+        run: maturin develop --release
+
+      - name: Run test suite
+        # Skip Ray-cluster "slow" tests and micro-benchmarks in CI.
+        run: python -m pytest tests/ -q -m "not slow and not benchmark"
+
+  # ---- required gate: code is rustfmt-clean ----
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # ---- informational: clippy lints. Non-blocking until the warnings are
+  # burned down; then drop continue-on-error to make it a hard gate. ----
+  clippy:
+    name: clippy (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --lib --no-deps -- -D warnings
+
+  # ---- informational: the React observability dashboard builds. ----
+  frontend:
+    name: frontend build (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: install
+        working-directory: frontend
+        # no committed lockfile — resolve from package.json against the public registry
+        run: npm install --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - name: build
+        working-directory: frontend
+        run: npm run build
