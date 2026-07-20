@@ -18,7 +18,7 @@
 - ⬜ **B1 每个 shuffle 算子先 driver 全量 `to_arrow()`**(`ray.py:165-166,613-614,761`)→ 卡单 driver 内存。
 - ⬜ **B2 最终归并单点**(driver 或 worker0:`ray.py:461-464,586-592,783,810`)→ 高基数 GROUP BY / 全局 ORDER BY 汇一节点。
 - 🔧 **B3 非可分解聚合** → 已修:`STDDEV/VARIANCE`(pop+samp)现在走**精确两阶段**(count/sum/sum²,实测与单机 0 误差);`MEDIAN/QUANTILE/COUNT(DISTINCT)/STRING_AGG` 等标记 `NotDecomposable` → **优雅 fallback 单机**(不再 `ValueError` 烧重试)。(`_agg.py` + `ray.py` `_collect_once`)待办:COUNT(DISTINCT) shuffle 精确化、分位数走可合并 t-digest sketch。
-- ⬜ **B4 shuffle 无 spill + 无 skew 处理**:`hash%b` 无加盐(`_ray_shim.py:570`),reducer 全量 `concat_tables`,热 key OOM 拖垮整查询。
+- 🔧 **B4 shuffle 无 skew 处理**(spill 按用户要求不做)→ 已修:`distributed_join`(inner + 单 key)加**加盐倾斜连接**——检测重击 key(左侧计数 > 均分的 ~4x),把热 key 的左行随机撒到所有桶、右行复制到每个桶,单个热 key 不再压垮一个 reducer;无热 key 时零开销(`_salt_skewed_inner` 返回 None 走原路径)。与单机 join 结果逐行一致。测试 `test_skew_join.py`(3:倾斜下 == 单机、热 key 跨桶扩散、无倾斜不加盐)。待办:streaming/DAG join 路径接入同一加盐(collect 默认走 streaming)。
 - ⬜ **B5 fuzzy dedup 热 band 单 worker 全量物化 + O(m²)**(`_ray_shim.py:437,459-462`)→ 真实模板页必 OOM。
 
 ## 🟡 C. LLM 数据引擎能力缺口(最贴定位,深耕方向)

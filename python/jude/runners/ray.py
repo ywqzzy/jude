@@ -702,6 +702,16 @@ class RayRunner(Runner):
         left_buckets = bucketize(left_t)
         right_buckets = bucketize(right_t)
 
+        # B4 skew handling (no spill): if a single equi-key is hot enough to
+        # overfill one reducer, salt it — spread that key's LEFT rows across all
+        # buckets and replicate its (few) RIGHT rows to all buckets, so no bucket
+        # holds the whole hot key. Correct for inner joins; only kicks in when a
+        # heavy hitter exists (zero overhead otherwise).
+        if how == "inner" and len(keys) == 1:
+            salted = self._salt_skewed_inner(conn, left_t, right_t, keys[0], b)
+            if salted is not None:
+                left_buckets, right_buckets = salted
+
         condition = " AND ".join(f"lhs.{k} = rhs.{k}" for k in keys)
         workers = self._ensure_workers()
         # Bucket i is joined on the worker the Rust WorkerManager assigned to it.
@@ -719,6 +729,69 @@ class RayRunner(Runner):
                 [workers[bucket_workers[0]].join_buckets.remote(left_buckets[0], right_buckets[0], condition, how, keys)]
             )[0]
         return pa.concat_tables(out).combine_chunks()
+
+    def _salt_skewed_inner(self, conn: Any, left_t: "pa.Table", right_t: "pa.Table",
+                           key: str, b: int) -> tuple | None:
+        """Salted bucketing for an inner join on a single key when a heavy-hitter
+        exists. Returns (left_buckets, right_buckets) each a list of b tables, or
+        None if no key is hot (caller keeps the plain hash bucketing).
+
+        Hot keys (count on the left > ~4x the even share) have their LEFT rows
+        randomly spread across all b buckets and their RIGHT rows replicated to
+        every bucket, so a single hot key can't pile onto one reducer. Non-hot
+        keys use the normal hash bucket on both sides. The union of buckets is a
+        correct partition of the inner join (every hot left row still meets all
+        its right matches via the replicated right side)."""
+        import pyarrow as pa
+
+        n = left_t.num_rows
+        if n < b * 64:
+            return None  # too small to bother
+        thresh = max(64, (n // b) * 4)
+        conn.register("l", left_t)
+        conn.register("r", right_t)
+        try:
+            hot = conn.sql(
+                f"SELECT {key} AS k FROM l GROUP BY {key} HAVING count(*) > {thresh}"
+            ).to_arrow().column("k").to_pylist()
+            if not hot:
+                return None
+            conn.register("hot", pa.table({"k": hot}))
+            # LEFT: non-hot -> hash bucket; hot -> round-robin salt across buckets
+            left_norm = conn.sql(
+                f"SELECT *, (hash({key}) % {b})::BIGINT AS _bkt FROM l "
+                f"WHERE {key} NOT IN (SELECT k FROM hot)"
+            ).to_arrow()
+            left_hot = conn.sql(
+                f"SELECT *, ((row_number() OVER () - 1) % {b})::BIGINT AS _bkt FROM l "
+                f"WHERE {key} IN (SELECT k FROM hot)"
+            ).to_arrow()
+            # RIGHT: non-hot -> hash bucket; hot -> replicate to every bucket
+            right_norm = conn.sql(
+                f"SELECT *, (hash({key}) % {b})::BIGINT AS _bkt FROM r "
+                f"WHERE {key} NOT IN (SELECT k FROM hot)"
+            ).to_arrow()
+            right_hot = conn.sql(
+                f"SELECT r.*, g.bkt::BIGINT AS _bkt FROM r "
+                f"JOIN (SELECT UNNEST(range({b})) AS bkt) g ON TRUE "
+                f"WHERE r.{key} IN (SELECT k FROM hot)"
+            ).to_arrow()
+        finally:
+            for t in ("l", "r", "hot"):
+                conn.unregister(t)
+
+        def split(norm: "pa.Table", hotb: "pa.Table") -> list:
+            merged = pa.concat_tables([norm, hotb]) if hotb.num_rows else norm
+            bkts = merged.column("_bkt").to_numpy(zero_copy_only=False)
+            data = merged.drop_columns(["_bkt"])
+            import numpy as np
+            out = []
+            for i in range(b):
+                idx = np.nonzero(bkts == i)[0]
+                out.append(data.take(pa.array(idx.tolist(), type=pa.int64())).combine_chunks())
+            return out
+
+        return split(left_norm, left_hot), split(right_norm, right_hot)
 
     def distributed_join_streaming(
         self,
