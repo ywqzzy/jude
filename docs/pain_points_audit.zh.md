@@ -42,7 +42,7 @@
 
 - 🔧 **E1 多机 shuffle bench** → 已加 `bench_multinode_shuffle.py`:模拟多节点(各自 object store)跑分布式 join/agg/sort + 正确性校验(此前 `bench_multinode` 只跑 UDF、无 shuffle)。
 - ⬜ **E2 FT 仅整查询重试且只覆盖 `collect()`**(`ray.py:132-157,386`);长任务不收敛;重试丢常驻 actor 状态。
-- 📝 **E3 Rust"调度大脑"半数死代码**(`ClusterScheduler.place`/locality 从不调用);真正编排在 Python `ray.py`。
+- 📝 **E3(已核实,措辞纠正)Rust 调度的现状**:**核心调度决策已在 Rust 且大量在用** —— `worker_for`(30 处)、`shuffle_bucket_count`(11)、`shuffle_bucket_workers`(10)、`target_partitions`/`partition_plan`/`dispatch_window`(分区大小、worker 路由、桶数、背压窗口)。**真正死的只有高级调度**:`ClusterScheduler.place`(跨查询装箱)+ `worker_for_locality`(局部性放置)—— 缺 node→worker plumbing 未接线。Python `ray.py` 里是**控制流胶水**(DAG 遍历、Ray ObjectRef 路由、SQL 拼接),这部分无法搬进 Rust(ObjectRef 是 Ray 句柄)。**下一步 Rust 化**:把 split 分配(文件/分区→worker,size-aware)从 Python 均分改为调 Rust `ArbitrarySplitAssigner`,并接线 locality/bin-pack —— 需 maturin 重编(本机磁盘 ~1.7GB 暂不够,待腾盘)。
 - ⬜ **E4 backpressure + GPU admission 默认关**(`max_task_backlog=0`,`num_gpus_per_worker=0`)。
 
 ## 测试盲区(横跨)
