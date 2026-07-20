@@ -369,6 +369,11 @@ class RelationPipeline:
     def _use_cosmos(self) -> bool:
         if self.engine == "cosmos":
             if not jp.is_cosmos_backed():
+                st = jp.cosmos_status()
+                if st["kind"] == "import-failed":
+                    raise RuntimeError(
+                        "engine='cosmos' but cosmos-xenna failed to import "
+                        f"(likely a version skew): {st['error']}")
                 raise RuntimeError("engine='cosmos' but cosmos-xenna is not installed")
             return True
         if self.engine == "auto":
@@ -380,21 +385,25 @@ class RelationPipeline:
 
         Records into jude's observability registry (jude.observe) so multi-stage
         pipelines show up on the dashboard alongside SQL/UDF work: one query per
-        run, one stage per pipeline stage, with row counts.
+        run, and a REAL per-stage funnel (rows in→out per stage) on the local
+        engine.
         """
         from jude import observe
 
-        engine = "cosmos" if self._use_cosmos() else "local"
+        use_cosmos = self._use_cosmos()
+        engine = "cosmos" if use_cosmos else "local"
         shards = self._shards()
         if not self._stages:
             return shards_to_table(shards)
         with observe.query(f"pipeline[{engine}]: {len(self._stages)} stages", kind="pipeline") as q:
-            for st in self._stages:
-                q.stage(type(st).__name__).done()
-            if self._use_cosmos():
+            if use_cosmos:
+                # cosmos owns execution + returns only the last stage's output, so
+                # per-stage row counts aren't observable here; record names only.
+                for st in self._stages:
+                    q.stage(type(st).__name__).done()
                 out = self._run_cosmos(shards)
             else:
-                out = self._run_local(shards)
+                out = self._run_local(shards, q)  # records the real per-stage funnel
             table = shards_to_table(out)
             q.done(rows=table.num_rows, nbytes=table.nbytes)
             return table
@@ -407,13 +416,17 @@ class RelationPipeline:
             con = jude.connect()
         return con.from_arrow(self.run())
 
-    def _run_local(self, shards: list[pa.Table]) -> list[pa.Table]:
-        """Sequential in-process engine sharing the cosmos Stage API."""
+    def _run_local(self, shards: list[pa.Table], q: Any = None) -> list[pa.Table]:
+        """Sequential in-process engine sharing the cosmos Stage API. When an
+        observe query handle ``q`` is given, record a real funnel: rows in→out
+        (and dropped) per stage, so the dashboard shows which stage filtered how
+        much."""
         data = shards
         for stage in self._stages:
             stage.setup(None)
         try:
             for stage in self._stages:
+                sh = q.stage(type(stage).__name__) if q is not None else None
                 bs = max(1, int(getattr(stage, "stage_batch_size", 1)))
                 out: list[pa.Table] = []
                 for start in range(0, len(data), bs):
@@ -422,6 +435,13 @@ class RelationPipeline:
                     if res:
                         out.extend(res)
                 data = out
+                if sh is not None:
+                    rows_out = sum(t.num_rows for t in data)
+                    nbytes = sum(t.nbytes for t in data)
+                    # real funnel: rows_in→rows_out (dropped = rows_in - rows_out)
+                    # recorded on the stage; the dashboard StagesPanel renders it.
+                    sh.progress(rows=rows_out, nbytes=nbytes)
+                    sh.done()
         finally:
             for stage in self._stages:
                 try:

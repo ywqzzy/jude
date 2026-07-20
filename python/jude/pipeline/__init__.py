@@ -36,6 +36,7 @@ single-node without the heavy dependency.
 from __future__ import annotations
 
 _COSMOS = False
+_COSMOS_IMPORT_ERROR: str | None = None
 
 try:  # Prefer the real engine.
     import cosmos_xenna.pipelines.v1 as _cx
@@ -63,9 +64,12 @@ try:  # Prefer the real engine.
         "run_pipeline",
         "is_cosmos_backed",
     ]
-except Exception:
+except Exception as _e:
     # Minimal local fallback (no cosmos-xenna / Ray). Enough for single-node
-    # sequential stage execution; see jude.pipeline._fallback.
+    # sequential stage execution; see jude.pipeline._fallback. Capture WHY it
+    # failed so a version skew ("installed but import broke") is distinguishable
+    # from "not installed" — the fallback must never be a *silent* degrade.
+    _COSMOS_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
     from jude.pipeline._fallback import (  # noqa: F401
         ExecutionMode,
         Pipeline,
@@ -87,6 +91,17 @@ except Exception:
 def is_cosmos_backed() -> bool:
     """True if jude.pipeline is backed by the real cosmos-xenna engine."""
     return _COSMOS
+
+
+def cosmos_status() -> dict:
+    """Why the cosmos backend is / isn't active. ``backed`` True = real
+    cosmos-xenna; else ``error`` says whether it's missing or failed to import
+    (e.g. a version skew), so a degrade to the local engine is never silent."""
+    if _COSMOS:
+        return {"backed": True, "error": None}
+    err = _COSMOS_IMPORT_ERROR or ""
+    kind = "not-installed" if ("No module named" in err or not err) else "import-failed"
+    return {"backed": False, "error": _COSMOS_IMPORT_ERROR, "kind": kind}
 
 
 # Relation-integrated multi-stage pipeline (source/sink are jude relations).
