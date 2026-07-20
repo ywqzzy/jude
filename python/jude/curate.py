@@ -121,6 +121,8 @@ __all__ = [
     "normalize_unicode",
     "fix_encoding",
     "token_length_filter",
+    "add_provenance",
+    "blend_by_tokens",
     # cosmos stages
     "ChunkStage",
     "QualityFilterStage",
@@ -831,6 +833,87 @@ def token_length_filter(
         if (min_tokens is None or c >= min_tokens) and (max_tokens is None or c <= max_tokens)
     ]
     return table.take(pa.array(keep, type=pa.int64()))
+
+
+# --- L5.1/L5.2. token-ratio blend + provenance -------------------------------
+
+
+def add_provenance(table: pa.Table, source: str, *, column: str = "_source") -> pa.Table:
+    """Tag every row with its ``source`` (provenance): which dataset/source this
+    document came from, so a blended corpus stays traceable per row."""
+    arr = pa.array([str(source)] * table.num_rows, type=pa.string())
+    if column in table.column_names:
+        return table.set_column(table.column_names.index(column), column, arr)
+    return table.append_column(column, arr)
+
+
+def blend_by_tokens(
+    tables: list[pa.Table],
+    token_ratios: list[float] | None = None,
+    *,
+    tokenizer: Any = "bytes",
+    total_tokens: int | None = None,
+    column: str = "text",
+    source_names: list[str] | None = None,
+    provenance_column: str | None = "_source",
+    seed: int = 0,
+) -> pa.Table:
+    """Blend datasets to hit target **token** ratios (not row ratios) — LLM
+    training mixes are specified in tokens (e.g. 60% web / 30% code / 10% books
+    by token budget). Samples documents from each source until its token quota
+    (``total_tokens * ratio``) is met, upsampling with replacement if a source is
+    too small, tags each row's ``provenance_column`` with its source, and
+    shuffles. Token counts use the pluggable ``tokenizer`` (see jude.tokenize).
+    Deterministic given ``seed``."""
+    import numpy as np
+
+    from jude.tokenize import _resolve_tokenizer
+
+    tables = [t for t in tables if t.num_rows > 0]
+    if not tables:
+        raise ValueError("blend_by_tokens: no non-empty tables")
+    k = len(tables)
+    ratios = token_ratios if token_ratios is not None else [1.0] * k
+    if len(ratios) != k:
+        raise ValueError("token_ratios length must match number of tables")
+    s = float(sum(ratios))
+    ratios = [r / s for r in ratios]
+    names = source_names if source_names is not None else [f"source{i}" for i in range(k)]
+
+    enc, _ = _resolve_tokenizer(tokenizer)
+    per_counts = [[len(enc(x or "")) for x in t.column(column).to_pylist()] for t in tables]
+    src_tokens = [sum(c) for c in per_counts]
+    budget = total_tokens if total_tokens is not None else sum(src_tokens)
+    rng = np.random.default_rng(seed)
+    parts = []
+    for t, counts, frac, name in zip(tables, per_counts, ratios, names):
+        quota = budget * frac
+        if quota <= 0 or t.num_rows == 0:
+            continue
+        take: list[int] = []
+        acc = 0
+        for i in rng.permutation(t.num_rows):
+            take.append(int(i))
+            acc += counts[int(i)]
+            if acc >= quota:
+                break
+        # source too small for its quota -> upsample with replacement
+        avg = (src_tokens[tables.index(t)] / t.num_rows) or 1
+        guard = 0
+        while acc < quota and guard < budget:  # guard against zero-length docs
+            i = int(rng.integers(0, t.num_rows))
+            take.append(i)
+            acc += counts[i]
+            guard += max(1, counts[i], int(avg))
+        sub = t.take(pa.array(take, type=pa.int64()))
+        if provenance_column:
+            sub = add_provenance(sub, name, column=provenance_column)
+        parts.append(sub)
+    if not parts:
+        return tables[0].slice(0, 0)
+    merged = pa.concat_tables(parts, promote_options="default").combine_chunks()
+    perm = rng.permutation(merged.num_rows)
+    return merged.take(pa.array(perm.tolist(), type=pa.int64()))
 
 
 # --- cosmos pipeline stages --------------------------------------------------
