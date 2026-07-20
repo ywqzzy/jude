@@ -201,7 +201,9 @@ def knn_rerank(
     ds = _lance.dataset_cached(path)
     want = None
     if columns is not None:
-        want = list(dict.fromkeys(list(columns) + [column]))
+        # always keep the id column in the payload (so callers can join results
+        # back) even when `columns` omits it; and the vector column for re-rank.
+        want = list(dict.fromkeys(list(columns) + [id_column, column]))
     nearest = {"column": column, "q": [float(x) for x in query], "k": cand_k}
     if nprobes is not None:
         nearest["nprobes"] = int(nprobes)
@@ -249,31 +251,39 @@ def knn_rerank(
 
 # --- in-memory-rerank ANN: IVF prunes, RAM reranks (the fast path) -----------
 
-_RESIDENT_VEC: dict = {}  # (path, column) -> (epoch, ids, id_to_row, matrix, norms)
+_RESIDENT_VEC: dict = {}  # (path, column, id_column) -> (epoch, ids, id_to_row, matrix, norms)
 
 
-def _resident_vectors(path: str, column: str):
+def _id_key(x):
+    """Hashable, JSON-friendly key for an id value of ANY type (int / str / UUID).
+    numpy scalars -> their Python value; str/bytes/objects pass through. Never
+    coerces to int (that silently corrupts string/UUID ids)."""
+    return x.item() if hasattr(x, "item") else x
+
+
+def _resident_vectors(path: str, column: str, id_column: str = "id"):
     """Load a Lance dataset's id + vector column into RAM once and cache it, as
     (ids, id->row map, float32 matrix, row norms). Reused across queries so the
     exact re-rank never re-reads vectors from Lance. The cache is stamped with the
     dataset's mutation epoch (see _lance.epoch) and reloads when it advances, so a
-    query after an append/delete/merge never re-ranks against a stale matrix."""
+    query after an append/delete/merge never re-ranks against a stale matrix.
+    ``id_column`` may hold any type (int/str/UUID); ids keep their native type."""
     import numpy as np
 
     from jude import _lance
 
-    key = (path, column)
+    key = (path, column, id_column)
     ep = _lance.epoch(path)
     r = _RESIDENT_VEC.get(key)
     if r is None or r[0] != ep:  # never loaded, or dataset mutated since
         tbl = _lance.dataset_cached(path).to_table(columns=None)
-        ids = np.asarray(tbl.column("id").to_numpy(zero_copy_only=False))
+        ids = np.asarray(tbl.column(id_column).to_numpy(zero_copy_only=False))
         col = tbl.column(column).combine_chunks()
         d = col.type.list_size
         mat = col.flatten().to_numpy(zero_copy_only=False).astype("float32", copy=False).reshape(len(ids), d)
         norms = np.linalg.norm(mat, axis=1)
         norms[norms == 0] = 1.0
-        id_to_row = {int(x): i for i, x in enumerate(ids)}
+        id_to_row = {_id_key(x): i for i, x in enumerate(ids)}
         r = (ep, ids, id_to_row, mat, norms)
         _RESIDENT_VEC[key] = r
     return r[1:]  # (ids, id_to_row, mat, norms) — epoch is bookkeeping
@@ -288,6 +298,7 @@ def knn_ann_resident(
     overfetch: int = 5,
     nprobes: int | None = None,
     metric: str = "cosine",
+    id_column: str = "id",
 ) -> "pa.Table":
     """FAST two-stage ANN: Lance IVF returns candidate **IDs only** (no vector
     materialization through Arrow — that per-query fetch is what makes plain
@@ -299,26 +310,27 @@ def knn_ann_resident(
     Requires a Lance vector index on ``column``; the full column is held resident
     in memory (see ``_resident_vectors``) — for datasets that fit in RAM. For
     larger-than-RAM corpora use ``knn_rerank`` (streams vectors from Lance) or the
-    distributed sharded path.
+    distributed sharded path. ``id_column`` may be any type (int/str/UUID); the
+    returned ``id`` keeps its native type.
     """
     import numpy as np
 
     from jude import _lance
 
-    ids, id_to_row, mat, norms = _resident_vectors(path, column)
+    ids, id_to_row, mat, norms = _resident_vectors(path, column, id_column)
     cand_k = max(k, k * max(1, overfetch))
     ds = _lance.dataset_cached(path)
     nearest = {"column": column, "q": [float(x) for x in query], "k": cand_k}
     if nprobes is not None:
         nearest["nprobes"] = int(nprobes)
     # stage 1: candidate IDs only — no vector column materialized to Python
-    cand = ds.to_table(nearest=nearest, columns=["id"])
-    cand_ids = cand.column("id").to_numpy(zero_copy_only=False)
-    rows = np.fromiter((id_to_row.get(int(x), -1) for x in cand_ids), dtype=np.int64,
+    cand = ds.to_table(nearest=nearest, columns=[id_column])
+    cand_ids = cand.column(id_column).to_numpy(zero_copy_only=False)
+    rows = np.fromiter((id_to_row.get(_id_key(x), -1) for x in cand_ids), dtype=np.int64,
                        count=len(cand_ids))
     rows = rows[rows >= 0]
     if rows.size == 0:
-        return pa.table({"id": pa.array([], type=pa.int64()),
+        return pa.table({"id": pa.array(ids[:0]),  # empty, but native id type
                          "_distance": pa.array([], type=pa.float64())})
     # stage 2: exact re-rank against the RAM matrix
     sub = mat[rows]
@@ -335,7 +347,7 @@ def knn_ann_resident(
     part = np.argpartition(dist, kk - 1)[:kk]
     order = part[np.argsort(dist[part])]
     keep = rows[order]
-    return pa.table({"id": pa.array(ids[keep].tolist(), type=pa.int64()),
+    return pa.table({"id": pa.array(ids[keep]),  # native id type preserved
                      "_distance": pa.array(dist[order].tolist(), type=pa.float64())})
 
 
@@ -505,7 +517,7 @@ def distributed_ann_knn(
     # optional `where` metadata pre-filter pushed into each shard's index scan)
     refs = [
         workers[r.mgr.worker_for(i)].vector_knn_shard.remote(
-            path, column, list(query), k, overfetch, nprobes, metric, where
+            path, column, list(query), k, overfetch, nprobes, metric, where, id_column
         )
         for i, path in enumerate(shard_paths)
     ]
@@ -529,6 +541,7 @@ def distributed_knn_resident(
     *,
     k: int = 10,
     metric: str = "cosine",
+    id_column: str = "id",
     runner: Any = None,
 ) -> "pa.Table":
     """Distributed EXACT KNN over RESIDENT shards. Each element of ``shard_paths``
@@ -539,6 +552,7 @@ def distributed_knn_resident(
     whole table from the driver every query — fine for one-shot, terrible for
     repeated queries), here the data stays resident on the workers and only the
     query vector travels — the correct architecture for repeated vector search.
+    ``id_column`` may be any type (int/str/UUID); the returned id keeps its type.
     """
     r = runner
     if r is None:
@@ -549,7 +563,7 @@ def distributed_knn_resident(
 
     workers = r._ensure_workers()
     refs = [
-        workers[r.mgr.worker_for(i)].vector_exact_shard.remote(path, column, list(query), k, metric)
+        workers[r.mgr.worker_for(i)].vector_exact_shard.remote(path, column, list(query), k, metric, id_column)
         for i, path in enumerate(shard_paths)
     ]
     locals_ = [t for t in shim.get(refs) if t is not None and t.num_rows > 0]
@@ -572,6 +586,7 @@ def distributed_knn_resident_batch(
     *,
     k: int = 10,
     metric: str = "cosine",
+    id_column: str = "id",
     runner: Any = None,
 ) -> list:
     """BATCHED distributed EXACT KNN over resident shards — the throughput path.
@@ -598,7 +613,7 @@ def distributed_knn_resident_batch(
     qs = [list(q) for q in queries]
     workers = r._ensure_workers()
     refs = [
-        workers[r.mgr.worker_for(i)].vector_exact_shard_batch.remote(path, column, qs, k, metric)
+        workers[r.mgr.worker_for(i)].vector_exact_shard_batch.remote(path, column, qs, k, metric, id_column)
         for i, path in enumerate(shard_paths)
     ]
     parts = [t for t in shim.get(refs) if t is not None and t.num_rows > 0]
@@ -610,6 +625,8 @@ def distributed_knn_resident_batch(
     qi = merged.column("qi").to_numpy(zero_copy_only=False)
     dist = merged.column("_distance").to_numpy(zero_copy_only=False)
     ids = merged.column("id").to_numpy(zero_copy_only=False)
+    empty_id = merged.column("id").slice(0, 0)  # native id type for no-hit queries
+    out = [pa.table({"id": empty_id, "_distance": pa.array([], type=pa.float64())}) for _ in qs]
     for i in range(len(qs)):
         sel = np.where(qi == i)[0]
         if sel.size == 0:
@@ -617,7 +634,7 @@ def distributed_knn_resident_batch(
         di = dist[sel]
         order = sel[np.argsort(di, kind="stable")[: int(k)]]
         out[i] = pa.table({
-            "id": pa.array(ids[order].tolist(), type=pa.int64()),
+            "id": pa.array(ids[order].tolist()),  # native id type preserved
             "_distance": pa.array(dist[order].tolist(), type=pa.float64()),
         })
     return out

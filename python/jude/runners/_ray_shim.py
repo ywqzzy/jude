@@ -51,19 +51,21 @@ def _realign(table: "pa.Table") -> "pa.Table":
     return table.take(pa.array(range(table.num_rows)))
 
 
-def _decode_shard(tbl: "pa.Table", column: str):
+def _decode_shard(tbl: "pa.Table", column: str, id_column: str = "id"):
     """Decode a Lance shard's id + vector column into (ids, matrix, norms) numpy
     arrays WITHOUT a per-element Python round-trip. A FixedSizeList<float32,d>
     column flattens to its contiguous child buffer, so ``.flatten().to_numpy()``
     + reshape is O(1) copies instead of materializing N*d Python floats (which is
     catastrophic at realistic dims like 768). Falls back to to_pylist only if the
-    fast path is unavailable."""
+    fast path is unavailable. ``id_column`` may be any type (int/str/UUID) and its
+    native type is preserved; if the shard has no id column, in-shard row indices
+    are used (only globally-unique when there is a single shard)."""
     import numpy as np
     import pyarrow as pa
 
     n = tbl.num_rows
-    ids = (np.asarray(tbl.column("id").to_numpy(zero_copy_only=False))
-           if "id" in tbl.column_names else np.arange(n))
+    ids = (np.asarray(tbl.column(id_column).to_numpy(zero_copy_only=False))
+           if id_column in tbl.column_names else np.arange(n))
     col = tbl.column(column).combine_chunks()
     try:
         if pa.types.is_fixed_size_list(col.type):
@@ -198,7 +200,8 @@ class _JudeWorker:
         return pa.Table.from_batches(batches).combine_chunks()
 
     def vector_knn_shard(self, path: str, column: str, query: list, k: int,
-                         overfetch: int, nprobes, metric: str, where=None) -> "pa.Table":
+                         overfetch: int, nprobes, metric: str, where=None,
+                         id_column: str = "id") -> "pa.Table":
         """Local top-k of ONE pre-indexed Lance shard, for distributed sharded
         ANN over billions of vectors. Uses the shard's own IVF index (two-stage
         ANN over-fetch + exact re-rank), with an optional metadata `where`
@@ -209,8 +212,8 @@ class _JudeWorker:
         out = _v.knn_rerank(path, column, list(query), k=k, overfetch=overfetch,
                             nprobes=nprobes, metric=metric, where=where)
         # return only id + _distance — never ship the (large) vector column back
-        # through Ray; the driver merges on _distance and takes ids.
-        keep = [c for c in out.column_names if c in ("id", "_distance")]
+        # through Ray; the driver merges on _distance and takes ids (any id type).
+        keep = [c for c in out.column_names if c in (id_column, "_distance")]
         return out.select(keep) if keep else out
 
     def fts_shard(self, path: str, column: str, query: str, k: int, columns) -> "pa.Table":
@@ -227,7 +230,7 @@ class _JudeWorker:
                           limit=int(k), columns=want)
         return _realign(out) if out.num_rows else out
 
-    def _resident_shard(self, path: str, column: str):
+    def _resident_shard(self, path: str, column: str, id_column: str = "id"):
         """(ids, mat, norms) for a resident Lance shard, cached on this actor and
         refreshed when the dataset's on-disk version advances. Opening the dataset
         is a cheap manifest read (no vector materialization); only a version bump
@@ -239,12 +242,13 @@ class _JudeWorker:
         ver = ds.version
         cached = self._vec_cache.get(path)
         if cached is None or cached[0] != ver:
-            ids, mat, norms = _decode_shard(ds.to_table(columns=None), column)
+            ids, mat, norms = _decode_shard(ds.to_table(columns=None), column, id_column)
             self._vec_cache[path] = (ver, ids, mat, norms)
             cached = self._vec_cache[path]
         return cached[1], cached[2], cached[3]
 
-    def vector_exact_shard(self, path: str, column: str, query: list, k: int, metric: str) -> "pa.Table":
+    def vector_exact_shard(self, path: str, column: str, query: list, k: int, metric: str,
+                           id_column: str = "id") -> "pa.Table":
         """Local EXACT top-k of ONE resident Lance shard (no index). The shard's
         vectors + ids are decoded to a numpy matrix ONCE and cached on this
         (persistent) actor, so repeated queries only broadcast the query vector
@@ -253,9 +257,9 @@ class _JudeWorker:
         import numpy as np
         import pyarrow as pa
 
-        ids, mat, norms = self._resident_shard(path, column)
+        ids, mat, norms = self._resident_shard(path, column, id_column)
         if mat.shape[0] == 0:
-            return pa.table({"id": pa.array([], type=pa.int64()), "_distance": pa.array([], type=pa.float64())})
+            return pa.table({"id": pa.array(ids[:0]), "_distance": pa.array([], type=pa.float64())})
         qv = np.asarray(query, dtype="float32")
         if metric == "cosine":
             qn = np.linalg.norm(qv) or 1.0
@@ -269,12 +273,12 @@ class _JudeWorker:
         part = np.argpartition(dist, kk - 1)[:kk]
         order = part[np.argsort(dist[part])]
         return pa.table({
-            "id": pa.array(ids[order].tolist(), type=pa.int64()),
+            "id": pa.array(ids[order]),  # native id type (int/str/UUID) preserved
             "_distance": pa.array(dist[order].tolist(), type=pa.float64()),
         })
 
     def vector_exact_shard_batch(self, path: str, column: str, queries: list, k: int,
-                                 metric: str) -> "pa.Table":
+                                 metric: str, id_column: str = "id") -> "pa.Table":
         """BATCHED resident exact KNN: ``queries`` is a B x dim matrix. The whole
         batch is scored against the cached resident shard in a SINGLE BLAS GEMM
         (B x N distances), so RPC + decode overhead is amortized across the whole
@@ -285,7 +289,7 @@ class _JudeWorker:
         import numpy as np
         import pyarrow as pa
 
-        ids, mat, norms = self._resident_shard(path, column)
+        ids, mat, norms = self._resident_shard(path, column, id_column)
         q = np.asarray(queries, dtype="float32")
         if q.ndim == 1:
             q = q.reshape(1, -1)
@@ -293,7 +297,7 @@ class _JudeWorker:
         n = mat.shape[0]
         if n == 0:
             return pa.table({"qi": pa.array([], type=pa.int32()),
-                             "id": pa.array([], type=pa.int64()),
+                             "id": pa.array(ids[:0]),
                              "_distance": pa.array([], type=pa.float64())})
         # one big GEMM for the whole batch: B x N
         if metric == "cosine":
@@ -320,7 +324,7 @@ class _JudeWorker:
             d_out.extend(di[order].tolist())
         return pa.table({
             "qi": pa.array(qi_out, type=pa.int32()),
-            "id": pa.array(id_out, type=pa.int64()),
+            "id": pa.array(id_out),  # native id type inferred (int/str/UUID)
             "_distance": pa.array(d_out, type=pa.float64()),
         })
 

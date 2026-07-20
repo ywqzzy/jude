@@ -7,10 +7,10 @@
 
 ## 🔴 A. 静默正确性问题(无报错、结果直接错 —— 最优先)
 
-- ⬜ **A1 常驻缓存永不失效** → 数据更新后静默返回旧结果。`vector._RESIDENT_VEC`(`vector.py:252`)、actor `_vec_cache`(`_ray_shim.py:105`)、`_DS_CACHE`(`_lance.py:20`)在 `append/delete/merge_insert/add_columns/optimize_indices` 后都不清(只在 `create_branch`/`commit_index_segments` 清)。**最尖锐的正确性缺口**。修法:写操作后 `_DS_CACHE.pop` + 版本号失效常驻矩阵。
+- 🔧 **A1 常驻缓存永不失效** → 已修:`_lance` 每个 path 加 mutation-epoch + `invalidate(path)`(丢句柄 + bump epoch),接进所有写算子(append/delete/merge_insert/add_columns/compact/optimize_indices/restore/index build/fragment commit);`vector._RESIDENT_VEC` 按 epoch 失效重载;actor `_vec_cache` 按数据集**磁盘版本号**失效(跨进程自愈,只读 manifest 很便宜)。测试 `test_cache_invalidation.py`(7)。
 - ⬜ **A2 分布式 BM25 比较分片本地分数** → 全局排序错。`distributed_fts` 用 `_score DESC` 归并(`vector.py:737`),但每片 BM25 用各自的 IDF+avgdl。修法:一次 map-reduce 预扫收集全局 `N`/`df`/`avgdl` 再重打分。
 - ⬜ **A3 分布式 fuzzy dedup 只按第一个 band 路由 + 无跨桶连通分量**(`_ray_shim.py:377`,单机是全 band `curate.py:273-277`)→ 召回严格差于单机且静默。修法:全 band 路由 + 跨片 CC/label-propagation。
-- ⬜ **A4 快/分布式向量路径硬编码整数 id + 无 payload**:`id_to_row={int(x)...}`(`vector.py:273`),无 `id` 列时用分片内行号当全局 id(`_ray_shim.py:65-66`)→ 字符串/UUID id 静默错。`id_column` 参数在 `knn_rerank`/`distributed_ann_knn` 是死参。
+- 🔧 **A4 快/分布式向量路径硬编码整数 id** → 已修:新增 `_id_key`(不再 `int(x)` 强转),`_resident_vectors`/`knn_ann_resident`/`_decode_shard`/`vector_exact_shard(_batch)`/`vector_knn_shard` 全部接 `id_column` 参数并**保留原生 id 类型**(int/str/UUID);`distributed_knn_resident(_batch)`/`distributed_ann_knn` 透传 `id_column`;`knn_rerank` 的 `id_column` 从死参变为"payload 恒含 id 列"。测试 `test_vector_string_ids.py`(3,含分布式)。待办:resident 路径的 payload 列直返(目前 payload 走 `knn_rerank` 的 `columns`)。
 - ⬜ **A5 `semantic_dedup` 阈值图传递闭包**(A~B~C 链式合并)+ 全表 O(n²) 单机(`curate.rs:498-515`,`curate.py:305`)→ 过度合并、不 scale。已有 Rust kmeans(`curate_py.rs:363`)未接线。修法:聚类内按质心去重(真 SemDeDup)。
 
 ## 🟠 B. 规模悬崖(号称分布式,实卡单机)
