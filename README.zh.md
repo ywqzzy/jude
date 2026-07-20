@@ -130,11 +130,14 @@ rel = rel.with_column("wav", jude.mm("audio").audio.decode(sample_rate=16000, mo
 ### 🧹 LLM 数据治理 —— 核心差异点
 决定训练集形态的算子,单机**和**分布式(`jude.curate` / `jude.curate_dist`):
 
-- **去重** —— 精确(SHA-256)、模糊(MinHash-LSH)、语义(SemDeDup:embedding 聚类 + 分布式 k-means)。
-- **质量过滤** —— Gopher / C4 启发式、语种识别、PII 检测/脱敏。
-- **去污染** —— 与评测集做 n-gram 重叠检测。
+- **去重** —— 精确(SHA-256)、模糊(MinHash-LSH,bands 按 Jaccard 阈值自动校准;分布式形态用全局连通分量做到与单机召回逐行一致)、语义(贪心非传递 SemDeDup + 分布式 k-means)、**精确子串**(Lee et al. 滚动哈希:剥离跨不同文档的共享段落/样板)。
+- **网页语料清洗** —— C4 式行级过滤、跨文档行去重、mojibake 修复 + Unicode NFC 规范化。
+- **质量过滤** —— Gopher/C4 启发式(停用词门、重复 n-gram、数字/符号比)、**模型质量分类器作为批处理 stage**(`jude.model_stage`:自带 CPU fastText/ONNX 模型、远程 vLLM/API 端点、或任意 callable —— GPU 可选)、token 感知长度门、语种识别。
+- **PII** —— 检测/脱敏(邮箱、URL、IPv4、SSN、Luhn 校验的信用卡)。
+- **去污染** —— 抗稀释的 benchmark 覆盖度重叠检测。
 - **切块** —— 定长 / 递归,用于分词与 RAG。
-- **结构化输出与训练格式** —— schema 校验抽取,导出训练就绪格式。
+- **训练就绪输出** —— `jude.tokenize`:分词(可插拔 byte / tiktoken / HF)、打包成定长序列(文档边界 + EOS)、写 token 分片(Lance 或可 memmap 的 `.bin`/`.idx.json`)。
+- **画像** —— `jude.profile`:一遍扫出语料统计,HyperLogLog 近似基数(去重率)、长度分位、语种分布 —— 大规模下 O(1) 内存。
 
 Rust 热点循环 + cosmos-xenna 阶段流水线;每个算子都有分布式形态。
 

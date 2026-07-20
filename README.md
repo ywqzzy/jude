@@ -159,13 +159,25 @@ rel = rel.with_column("wav", jude.mm("audio").audio.decode(sample_rate=16000, mo
 The operators that shape a training set, single-node **and** distributed
 (`jude.curate` / `jude.curate_dist`):
 
-- **Deduplication** — exact (SHA-256), fuzzy (MinHash-LSH), semantic (SemDeDup:
-  embedding clustering + distributed k-means).
-- **Quality filtering** — Gopher / C4 heuristics, language ID, PII detect/redact.
-- **Decontamination** — n-gram overlap against eval sets.
+- **Deduplication** — exact (SHA-256), fuzzy (MinHash-LSH, bands auto-calibrated
+  to the Jaccard threshold; distributed form recall-matches single-node via
+  global connected-components), semantic (greedy non-transitive SemDeDup +
+  distributed k-means clustering), and **exact-substring** (Lee et al. rolling-hash:
+  strips shared passages/boilerplate across differing docs).
+- **Web-corpus cleaning** — C4-style line filtering, cross-document line dedup,
+  mojibake repair + Unicode NFC normalization.
+- **Quality filtering** — Gopher/C4 heuristics (stopword gate, repeated-n-gram,
+  digit/symbol ratios), **model-based** classifiers as a batched stage
+  (`jude.model_stage`: bring a CPU fastText/ONNX model, a remote vLLM/API
+  endpoint, or any callable — GPU optional), token-aware length gates, language ID.
+- **PII** — detect / redact (email, URL, IPv4, SSN, Luhn-validated credit cards).
+- **Decontamination** — dilution-resistant benchmark-coverage overlap against eval sets.
 - **Chunking** — fixed / recursive, for tokenization and RAG.
-- **Structured output & training formats** — schema-validated extraction, export
-  to training-ready layouts.
+- **Training-ready output** — `jude.tokenize`: tokenize (pluggable byte /
+  tiktoken / HF), pack into fixed-length sequences (doc boundaries + EOS), and
+  write token shards (Lance or memory-mappable `.bin`/`.idx.json`).
+- **Profiling** — `jude.profile`: one-pass corpus stats with HyperLogLog
+  cardinality (dup-rate), length percentiles, language mix — O(1) memory at scale.
 
 Rust hot loops with cosmos-xenna stage pipelines; every operator has a
 distributed form.
@@ -195,7 +207,13 @@ con.sql("SELECT 42 AS answer").show()
 
 # curation: fuzzy-dedup a corpus
 from jude import curate
-clean = curate.fuzzy_dedup(corpus, threshold=0.7, bands=16)
+clean = curate.fuzzy_dedup(corpus, threshold=0.7)   # bands auto-calibrated to threshold
+
+# training-ready output: clean text -> tokens -> packed sequences -> shards
+from jude import tokenize as tk
+toks = tk.tokenize(clean, tokenizer="bytes")         # or a tiktoken / HF tokenizer
+packed = tk.pack_sequences(toks, seq_len=2048)       # doc boundaries + EOS
+tk.write_token_shards(packed, "train_shard", fmt="bin")   # memmap-able .bin/.idx.json
 
 # vector search: build an index, query with in-RAM rerank
 from jude import vector
