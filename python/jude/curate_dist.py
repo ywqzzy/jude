@@ -145,7 +145,7 @@ def dist_exact_dedup(
 
 def dist_fuzzy_dedup(
     table: pa.Table, *, column: str = "text", threshold: float = 0.7,
-    num_hashes: int = 128, ngram: int = 2, bands: int = 16, seed: int = 1,
+    num_hashes: int = 128, ngram: int = 2, bands: int | None = None, seed: int = 1,
     keep_cluster: bool = False, runner: Any = None,
 ) -> pa.Table:
     """Distributed MinHash-LSH fuzzy dedup, recall-matched to single-node.
@@ -162,7 +162,10 @@ def dist_fuzzy_dedup(
     from jude.runners import _ray_shim as shim
     import jude
     from jude.jude import _curate
+    from jude.curate import optimal_lsh_bands
 
+    if bands is None:
+        bands = optimal_lsh_bands(threshold, num_hashes)  # calibrate to threshold (C3)
     r = _runner(runner)
     con = jude.connect()
     parts = r._partition_tables(con.from_arrow(table))

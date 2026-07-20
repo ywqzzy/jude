@@ -25,7 +25,7 @@
 
 - ⬜ **C1 缺 web 管线前半**:无 HTML/boilerplate 抽取、无行级 dedup、无精确子串/后缀数组 dedup、无 WARC 读(`llm_data_engine_plan.zh.md:52,118`)。
 - ⬜ **C2 quality 欠 Gopher/C4**:缺重复 n-gram 家族、stopword 门、C4 行过滤、blocklist;`digit_ratio` 等三信号算了不用(死信号,`curate.rs:792-818`);无 perplexity/fastText 质量分。
-- ⬜ **C3 LSH bands 不按 threshold 校准**(`curate.rs:101`)→ 单机也 ~38% 召回损失;默认 `ngram=2` 偏小。修法:datasketch 的 `(b,r)` 最优公式。
+- 🔧 **C3 LSH bands 不按 threshold 校准** → 已修:新增 `optimal_lsh_bands(threshold, num_hashes)`(datasketch 式最小化假阳+假阴面积,得 S 曲线 crossover≈threshold);`fuzzy_dedup`/`dist_fuzzy_dedup` 的 `bands` 默认 `None` → 按 threshold 自动校准(旧固定 16 只在 ~0.7 附近才准,别的阈值静默丢召回)。显式传 `bands` 仍可覆盖。测试 `test_lsh_calibration.py`(3:crossover 单调贴合、低阈值召回 ≥ 固定 16、显式覆盖)。默认 `ngram=2` 仍偏小(判断项,暂留以免动既有行为)。
 - ⬜ **C4 语言识别** 6 语启发式,日文 kanji 误判成 zh(`curate.rs:138`);无 fastText lid.176。
 - ⬜ **C5 多模态 curation 仅图像 pHash + 浅质量**;无 CLIP-score/NSFW/aesthetic、无音频、无视频级 dedup;`image_dedup` 单机 + 硬编码 `bands=4`。
 - ⬜ **C6 PII 无 Luhn/NER**(任意 9 位=SSN,`curate.rs:358`);去污染用文档侧比例(长文稀释,`curate.rs:399-411`)+ 合并 benchmark 边界。tokenizer-aware 长度缺(C15)。

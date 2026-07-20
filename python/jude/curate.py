@@ -28,6 +28,51 @@ import pyarrow as pa
 from .jude import _curate
 
 
+# --- LSH band calibration (C3) ----------------------------------------------
+
+
+def optimal_lsh_bands(threshold: float, num_hashes: int, *,
+                      fp_weight: float = 0.5, fn_weight: float = 0.5) -> int:
+    """Pick the number of LSH bands ``b`` (with rows ``r = num_hashes // b``)
+    whose S-curve ``p(s) = 1 - (1 - s**r)**b`` best matches the Jaccard
+    ``threshold`` — minimizing the weighted false-positive + false-negative area
+    (the datasketch calibration). A fixed band count (the old default 16) is only
+    well-tuned near threshold 0.7; at other thresholds it silently loses recall
+    (too few candidates) or wastes work. Deriving ``b`` from the threshold fixes
+    that. Returns ``b`` in ``[1, num_hashes]``.
+    """
+    if num_hashes <= 1:
+        return 1
+    threshold = min(max(float(threshold), 1e-6), 1.0 - 1e-6)
+
+    def _area(f, lo, hi, steps=64):  # trapezoidal integral of f over [lo, hi]
+        if hi <= lo:
+            return 0.0
+        h = (hi - lo) / steps
+        total = 0.5 * (f(lo) + f(hi))
+        for i in range(1, steps):
+            total += f(lo + i * h)
+        return total * h
+
+    best_b, best_err = 1, float("inf")
+    seen_r: set = set()
+    for b in range(1, num_hashes + 1):
+        r = num_hashes // b
+        if r < 1:
+            break
+        if (b, r) in seen_r:
+            continue
+        seen_r.add((b, r))
+        def p(s, _b=b, _r=r):
+            return 1.0 - (1.0 - s ** _r) ** _b
+        fp = _area(lambda s, _p=p: _p(s), 0.0, threshold)          # candidates below threshold
+        fn = _area(lambda s, _p=p: 1.0 - _p(s), threshold, 1.0)    # misses above threshold
+        err = fp_weight * fp + fn_weight * fn
+        if err < best_err:
+            best_err, best_b = err, b
+    return best_b
+
+
 def _observed(op: str):
     """Decorator: record a row-reducing curation op's rows_in→rows_out into the
     observability registry (data-quality keep-rate), guarded so it's a no-op when
@@ -235,7 +280,7 @@ def fuzzy_dedup(
     column: str = "text",
     num_hashes: int = 128,
     ngram: int = 2,
-    bands: int = 16,
+    bands: int | None = None,
     threshold: float = 0.7,
     seed: int = 1,
     keep_cluster: bool = False,
@@ -249,11 +294,18 @@ def fuzzy_dedup(
     single-node form; ``RayRunner.distributed_fuzzy_dedup`` shuffles the LSH
     buckets across workers for scale. ``keep_cluster`` adds a ``dup_cluster``
     column (the representative row id) instead of dropping.
+
+    ``bands`` defaults to a value CALIBRATED to ``threshold`` (see
+    ``optimal_lsh_bands``): the S-curve crossover is aligned to the threshold so
+    recall isn't lost to a mis-tuned band count. Pass an explicit ``bands`` to
+    override.
     """
     texts = _col(table, column)
     n = len(texts)
     if n == 0:
         return table
+    if bands is None:
+        bands = optimal_lsh_bands(threshold, num_hashes)
     sigs = _curate.minhash_signature_batch(texts, num_hashes, ngram, seed)
     band_keys = _curate.lsh_band_keys_batch(sigs, bands)
 
