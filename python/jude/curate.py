@@ -118,6 +118,8 @@ __all__ = [
     "c4_line_filter",
     "corpus_line_dedup",
     "substring_dedup",
+    "normalize_unicode",
+    "fix_encoding",
     # cosmos stages
     "ChunkStage",
     "QualityFilterStage",
@@ -735,6 +737,65 @@ def substring_dedup(
                 seen.add(h)
         kept = [toks[i] for i in range(n) if not dup[i]]
         out_texts.append(" ".join(kept))
+    arr = pa.array(out_texts, type=pa.string())
+    if dst in table.column_names:
+        return table.set_column(table.column_names.index(dst), dst, arr)
+    return table.append_column(dst, arr)
+
+
+# --- L1.2. text normalization: encoding fix + unicode NFC --------------------
+
+
+def normalize_unicode(
+    table: pa.Table,
+    *,
+    column: str = "text",
+    out_column: str | None = None,
+    form: str = "NFC",
+) -> pa.Table:
+    """Unicode-normalize a text column (default NFC — compose combining marks).
+    Makes downstream dedup/tokenization see canonically-equal strings as equal
+    (precomposed 'e-acute' vs 'e' + combining acute). Idempotent."""
+    import unicodedata
+
+    dst = out_column or column
+    out_texts = [unicodedata.normalize(form, t) if t else t for t in _col(table, column)]
+    arr = pa.array(out_texts, type=pa.string())
+    if dst in table.column_names:
+        return table.set_column(table.column_names.index(dst), dst, arr)
+    return table.append_column(dst, arr)
+
+
+# common mojibake markers: UTF-8 bytes mis-decoded as Latin-1/CP1252 leave these.
+_MOJIBAKE_HINTS = ("Ã", "Â", "â€", "Ð", "Ñ", "�")
+
+
+def _fix_one(text: str) -> str:
+    if not text or not any(h in text for h in _MOJIBAKE_HINTS):
+        return text
+    # classic fix: text was UTF-8, decoded as latin-1 -> re-encode latin-1, decode utf-8.
+    try:
+        repaired = text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    # only accept if it reduces the mojibake markers (avoid corrupting clean text)
+    before = sum(text.count(h) for h in _MOJIBAKE_HINTS)
+    after = sum(repaired.count(h) for h in _MOJIBAKE_HINTS)
+    return repaired if after < before else text
+
+
+def fix_encoding(
+    table: pa.Table,
+    *,
+    column: str = "text",
+    out_column: str | None = None,
+) -> pa.Table:
+    """Repair common mojibake (UTF-8 text mis-decoded as Latin-1/CP1252, e.g.
+    'A-tilde c-cedilla' garble -> the intended accented char) — a dependency-free
+    heuristic (swap in ``ftfy`` via a UDF for higher coverage). Only rewrites a
+    doc when the fix strictly reduces mojibake markers, so clean text is safe."""
+    dst = out_column or column
+    out_texts = [_fix_one(t) for t in _col(table, column)]
     arr = pa.array(out_texts, type=pa.string())
     if dst in table.column_names:
         return table.set_column(table.column_names.index(dst), dst, arr)
