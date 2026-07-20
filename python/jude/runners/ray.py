@@ -476,13 +476,18 @@ class RayRunner(Runner):
         # operator, so `.aggregate(...).repartition(n)` still routes to the agg.
         aspec = relation.aggregate_spec()
         if aspec is not None and aspec[2]:
-            from jude.runners._agg import build_two_phase
+            from jude.runners._agg import NotDecomposable, build_two_phase
 
             input_rel, group, aggs = aspec
             # jude stores the aggregate list as one string; split on top-level
             # commas (respecting parens) into individual aggregate expressions.
             agg_exprs = [e for a in aggs for e in _split_top_level_commas(a)]
-            partial_sql, final_sql = build_two_phase(list(group), agg_exprs)
+            try:
+                partial_sql, final_sql = build_two_phase(list(group), agg_exprs)
+            except NotDecomposable:
+                # e.g. MEDIAN / PERCENTILE / COUNT(DISTINCT) / STRING_AGG — not a
+                # partial->merge two-phase; run it single-node instead of erroring.
+                return relation.to_arrow()
             return self.distributed_aggregate(input_rel, partial_sql, final_sql)
         jspec = relation.join_spec()
         if jspec is not None and jspec[2] and jspec[3] in ("inner", "left", "right", "outer"):
