@@ -42,6 +42,9 @@ _KNOWN = {
     "redact_pii": _c.redact_pii,
     "detect_pii": _c.detect_pii,
     "global_shuffle": _c.global_shuffle,
+    "c4_line_filter": _c.c4_line_filter,
+    "corpus_line_dedup": _c.corpus_line_dedup,
+    "substring_dedup": _c.substring_dedup,
     # image
     "image_dedup": _cm.image_dedup,
     "image_quality_filter": _cm.image_quality_filter,
@@ -74,6 +77,9 @@ class CurationFlow:
     def detect_language(self, **kw): return self.add("detect_language", **kw)
     def language_filter(self, **kw): return self.add("language_filter", **kw)
     def redact_pii(self, **kw): return self.add("redact_pii", **kw)
+    def c4_line_filter(self, **kw): return self.add("c4_line_filter", **kw)
+    def corpus_line_dedup(self, **kw): return self.add("corpus_line_dedup", **kw)
+    def substring_dedup(self, **kw): return self.add("substring_dedup", **kw)
     def decontaminate(self, benchmark_texts, **kw):
         # decontaminate has a positional arg; store it in kwargs
         return self.add_decontaminate(benchmark_texts, **kw)

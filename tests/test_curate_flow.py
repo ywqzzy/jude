@@ -69,3 +69,31 @@ def test_unknown_op_raises():
     t = pa.table({"text": ["x"]})
     with pytest.raises(ValueError):
         cf.CurationFlow(t).add("nonexistent_op")
+
+
+def test_flow_chains_web_curation_ops():
+    """The new C1 web-curation ops chain in the fluent flow with a funnel."""
+    import pyarrow as pa
+    from jude import curate_flow as cf
+
+    footer = "Copyright 2026 Example Corp"
+    docs = [f"Intro one here.\n{footer}\nBody one here now.",
+            f"Intro two here.\n{footer}\nBody two here now.",
+            f"Intro three here.\n{footer}\nBody three now."]
+    flow = (cf.CurationFlow(pa.table({"text": docs}))
+            .corpus_line_dedup(min_docs=2)
+            .c4_line_filter(min_words=2))
+    out = flow.run()
+    assert [f["op"] for f in flow.funnel] == ["corpus_line_dedup", "c4_line_filter"]
+    assert all(footer.lower() not in t.lower() for t in out.column("text").to_pylist())
+
+
+def test_flow_substring_dedup_registered():
+    import pyarrow as pa
+    from jude import curate_flow as cf
+
+    passage = " ".join(f"w{i}" for i in range(60))
+    docs = [f"alpha {passage} beta", f"gamma {passage} delta"]
+    out = cf.CurationFlow(pa.table({"text": docs})).substring_dedup(k=50).run()
+    kept = out.column("text").to_pylist()
+    assert "w30" in kept[0] and "w30" not in kept[1]   # shared passage stripped from 2nd
