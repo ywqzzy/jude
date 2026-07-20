@@ -102,7 +102,7 @@ class _JudeWorker:
 
         self._jude = jude
         self._conn = jude.connect()
-        self._vec_cache: dict = {}  # path -> (ids, matrix) for resident exact KNN
+        self._vec_cache: dict = {}  # path -> (version, ids, matrix, norms); version-stamped
 
     def run_sql_on_table(self, table: "pa.Table", sql_template: str) -> "pa.Table":
         """Register ``table`` as ``part`` and run ``sql_template`` against it."""
@@ -227,6 +227,23 @@ class _JudeWorker:
                           limit=int(k), columns=want)
         return _realign(out) if out.num_rows else out
 
+    def _resident_shard(self, path: str, column: str):
+        """(ids, mat, norms) for a resident Lance shard, cached on this actor and
+        refreshed when the dataset's on-disk version advances. Opening the dataset
+        is a cheap manifest read (no vector materialization); only a version bump
+        pays the full decode. Without the version stamp a resident actor pool would
+        keep scoring queries against the pre-write matrix after an append/delete."""
+        import lance
+
+        ds = lance.dataset(path)  # fresh manifest read -> current latest version
+        ver = ds.version
+        cached = self._vec_cache.get(path)
+        if cached is None or cached[0] != ver:
+            ids, mat, norms = _decode_shard(ds.to_table(columns=None), column)
+            self._vec_cache[path] = (ver, ids, mat, norms)
+            cached = self._vec_cache[path]
+        return cached[1], cached[2], cached[3]
+
     def vector_exact_shard(self, path: str, column: str, query: list, k: int, metric: str) -> "pa.Table":
         """Local EXACT top-k of ONE resident Lance shard (no index). The shard's
         vectors + ids are decoded to a numpy matrix ONCE and cached on this
@@ -236,15 +253,7 @@ class _JudeWorker:
         import numpy as np
         import pyarrow as pa
 
-        cached = self._vec_cache.get(path)
-        if cached is None:
-            from jude import _lance
-
-            tbl = _lance.dataset_cached(path).to_table(columns=None)
-            ids, mat, norms = _decode_shard(tbl, column)
-            self._vec_cache[path] = (ids, mat, norms)
-            cached = self._vec_cache[path]
-        ids, mat, norms = cached
+        ids, mat, norms = self._resident_shard(path, column)
         if mat.shape[0] == 0:
             return pa.table({"id": pa.array([], type=pa.int64()), "_distance": pa.array([], type=pa.float64())})
         qv = np.asarray(query, dtype="float32")
@@ -276,15 +285,7 @@ class _JudeWorker:
         import numpy as np
         import pyarrow as pa
 
-        cached = self._vec_cache.get(path)
-        if cached is None:
-            from jude import _lance
-
-            tbl = _lance.dataset_cached(path).to_table(columns=None)
-            ids, mat, norms = _decode_shard(tbl, column)
-            self._vec_cache[path] = (ids, mat, norms)
-            cached = self._vec_cache[path]
-        ids, mat, norms = cached
+        ids, mat, norms = self._resident_shard(path, column)
         q = np.asarray(queries, dtype="float32")
         if q.ndim == 1:
             q = q.reshape(1, -1)

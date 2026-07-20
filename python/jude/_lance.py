@@ -19,6 +19,29 @@ import pyarrow as pa
 # dataset (open is not free; reopening per query dominates latency at scale).
 _DS_CACHE: dict = {}
 
+# Monotonic mutation epoch per dataset path. Every write/mutation (append,
+# delete, merge_insert, add_columns, compact, optimize_indices, restore,
+# index build, ...) bumps the epoch AND drops the cached handle. Downstream
+# resident caches (the in-RAM vector matrix in vector.py) compare the epoch they
+# loaded at against the current one and reload when it advances — so a query
+# after a write never silently returns stale data. Without this, a cached handle
+# / resident matrix would keep serving the pre-write snapshot forever.
+_EPOCH: dict = {}
+
+
+def epoch(path: str) -> int:
+    """Current mutation epoch for ``path`` (0 if never mutated). Resident caches
+    store the epoch they loaded at and reload when this advances."""
+    return _EPOCH.get(path, 0)
+
+
+def invalidate(path: str) -> None:
+    """Drop the cached dataset handle for ``path`` and bump its mutation epoch.
+    Call after ANY write/mutation so subsequent reads (and resident caches keyed
+    on the epoch) pick up the new snapshot instead of the stale one."""
+    _DS_CACHE.pop(path, None)
+    _EPOCH[path] = _EPOCH.get(path, 0) + 1
+
 # Lance keeps IVF centroids + partition postings in an in-memory LRU on the
 # dataset handle. Sizing it to hold the whole index keeps ANN queries fully
 # in-memory (no per-query re-read of index pages from disk). Overridable via
@@ -64,6 +87,7 @@ def write(table: pa.Table, path: str, mode: str = "create") -> dict:
     # mode: create | append | overwrite  (Lance's own write_dataset modes)
     m = {"create": "create", "append": "append", "overwrite": "overwrite"}.get(mode, "create")
     lance.write_dataset(table, path, mode=m)
+    invalidate(path)  # new snapshot — drop stale handle + bump epoch
     return {"path": path, "rows": table.num_rows}
 
 
@@ -82,6 +106,7 @@ def commit_fragments(path: str, fragments: list, schema: pa.Schema, mode: str = 
     else:  # overwrite / create
         op = lance.LanceOperation.Overwrite(schema, fragments)
         lance.LanceDataset.commit(path, op)
+    invalidate(path)  # committed a new snapshot
     return {"path": path, "fragments": len(fragments)}
 
 
@@ -107,6 +132,7 @@ def create_vector_index(
     if num_sub_vectors is not None:
         kw["num_sub_vectors"] = num_sub_vectors
     ds.create_index(column, **kw)
+    invalidate(path)  # index set changed — cached handle must not mask it
     return {"path": path, "column": column, "index_type": index_type}
 
 
@@ -115,6 +141,7 @@ def create_scalar_index(path: str, column: str, index_type: str = "BTREE") -> di
     equality) so filters on `column` skip data instead of scanning."""
     ds = lance.dataset(path)
     ds.create_scalar_index(column, index_type=index_type)
+    invalidate(path)
     return {"path": path, "column": column, "index_type": index_type}
 
 
@@ -147,6 +174,7 @@ def optimize_indices(path: str) -> dict:
     (a distributed write appends fragments that start out unindexed)."""
     ds = lance.dataset(path)
     ds.optimize.optimize_indices()
+    invalidate(path)  # index now covers folded-in fragments
     return {"path": path, "indices": [ix.get("name") for ix in ds.list_indices()]}
 
 
@@ -196,6 +224,7 @@ def restore(path: str, version: Any) -> dict:
     commit that restores the old state (history is preserved, git-revert style)."""
     ds = lance.dataset(path, version=version)
     ds.restore()
+    invalidate(path)  # latest pointer moved
     return {"path": path, "restored_from": version, "version": ds.version}
 
 
@@ -208,6 +237,7 @@ def create_fts_index(path: str, column: str, *, replace: bool = True, with_posit
     hybrid (keyword + vector) RAG without a separate search engine."""
     ds = lance.dataset(path)
     ds.create_scalar_index(column, index_type="INVERTED", replace=replace, with_position=with_position)
+    invalidate(path)  # FTS index added
     return {"path": path, "column": column, "index_type": "INVERTED"}
 
 
@@ -242,6 +272,7 @@ def add_columns(path: str, transforms: dict) -> dict:
     quality score or a derived field on a TB-scale dataset cheaply."""
     ds = lance.dataset(path)
     ds.add_columns(transforms)
+    invalidate(path)  # schema + data changed
     return {"path": path, "added": list(transforms.keys())}
 
 
@@ -256,6 +287,7 @@ def merge_insert(path: str, new_data: pa.Table, on: Any) -> dict:
         .when_not_matched_insert_all()
         .execute(new_data)
     )
+    invalidate(path)  # rows upserted
     return {"path": path, "on": keys, "rows": new_data.num_rows}
 
 
@@ -263,6 +295,7 @@ def delete(path: str, predicate: str) -> dict:
     """Delete rows matching a SQL predicate (remove dirty/flagged samples)."""
     ds = lance.dataset(path)
     ds.delete(predicate)
+    invalidate(path)  # rows removed — cached read must not resurrect them
     return {"path": path, "predicate": predicate}
 
 
@@ -271,6 +304,7 @@ def compact(path: str) -> dict:
     write (one fragment per worker produces many small files that slow scans)."""
     ds = lance.dataset(path)
     metrics = ds.optimize.compact_files()
+    invalidate(path)  # fragment layout changed
     return {"path": path, "fragments_removed": getattr(metrics, "fragments_removed", None),
             "fragments_added": getattr(metrics, "fragments_added", None)}
 
@@ -297,7 +331,7 @@ def create_branch(path: str, name: str, version: Any = None) -> dict:
     ds = lance.dataset(path)
     v = version if version is not None else ds.version
     ds.create_branch(name, v)
-    _DS_CACHE.pop(path, None)
+    invalidate(path)
     return {"path": path, "branch": name, "version": v}
 
 
@@ -319,6 +353,7 @@ def shallow_clone(path: str, target: str, ref: Any = None) -> dict:
     — cheap experiment branch without copying data files."""
     ds = lance.dataset(path)
     ds.shallow_clone(target, ref) if ref is not None else ds.shallow_clone(target)
+    invalidate(target)  # target dataset (re)created
     return {"path": path, "clone": target, "ref": ref}
 
 
@@ -347,5 +382,5 @@ def commit_index_segments(path: str, column: str, segments: list) -> dict:
     if merge is None:
         return {"committed": False, "note": "installed Lance lacks segment-commit API; use create_vector_index"}
     merge(column, segments)
-    _DS_CACHE.pop(path, None)
+    invalidate(path)
     return {"path": path, "column": column, "segments": len(segments)}

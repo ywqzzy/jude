@@ -249,20 +249,23 @@ def knn_rerank(
 
 # --- in-memory-rerank ANN: IVF prunes, RAM reranks (the fast path) -----------
 
-_RESIDENT_VEC: dict = {}  # (path, column) -> (ids, id_to_row, matrix, norms)
+_RESIDENT_VEC: dict = {}  # (path, column) -> (epoch, ids, id_to_row, matrix, norms)
 
 
 def _resident_vectors(path: str, column: str):
     """Load a Lance dataset's id + vector column into RAM once and cache it, as
     (ids, id->row map, float32 matrix, row norms). Reused across queries so the
-    exact re-rank never re-reads vectors from Lance."""
+    exact re-rank never re-reads vectors from Lance. The cache is stamped with the
+    dataset's mutation epoch (see _lance.epoch) and reloads when it advances, so a
+    query after an append/delete/merge never re-ranks against a stale matrix."""
     import numpy as np
 
-    key = (path, column)
-    r = _RESIDENT_VEC.get(key)
-    if r is None:
-        from jude import _lance
+    from jude import _lance
 
+    key = (path, column)
+    ep = _lance.epoch(path)
+    r = _RESIDENT_VEC.get(key)
+    if r is None or r[0] != ep:  # never loaded, or dataset mutated since
         tbl = _lance.dataset_cached(path).to_table(columns=None)
         ids = np.asarray(tbl.column("id").to_numpy(zero_copy_only=False))
         col = tbl.column(column).combine_chunks()
@@ -271,9 +274,9 @@ def _resident_vectors(path: str, column: str):
         norms = np.linalg.norm(mat, axis=1)
         norms[norms == 0] = 1.0
         id_to_row = {int(x): i for i, x in enumerate(ids)}
-        r = (ids, id_to_row, mat, norms)
+        r = (ep, ids, id_to_row, mat, norms)
         _RESIDENT_VEC[key] = r
-    return r
+    return r[1:]  # (ids, id_to_row, mat, norms) — epoch is bookkeeping
 
 
 def knn_ann_resident(
