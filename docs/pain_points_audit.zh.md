@@ -34,7 +34,7 @@
 
 - 🔧 **D1 cosmos 静默降级** → 已修:`cosmos_status()` + `_COSMOS_IMPORT_ERROR` 区分"未装 vs 导入失败(版本 skew)";`engine='cosmos'` 报真实原因。(`pipeline/__init__.py`)
 - 🔧 **D2 每-stage funnel 是假的**(执行前就标 done)→ 已修:`_run_local` 记录真实 rows_in→out per stage 进注册表。(`pipeline/_multimodal.py`)
-- ⬜ **D3 `from_datasource` 声称流式实则全量物化**(`_multimodal.py:322-324` `list(...)`)→ 大输入 OOM,文档误导。
+- 🔧 **D3 `from_datasource` 声称流式实则全量物化** → 已修:`from_datasource` 改存**惰性 thunk**(不再 `list()` 整个流拼成一张表);本地引擎对流式源走**深度优先**执行(`_iter_local_streaming`:一个输入 shard 走完整条 stage 链再拉下一个,输入内存有界);新增 `run_streaming()` 生成器端到端惰性产出 shard。测试 `test_pipeline_streaming.py`(4,含"取一个 shard 不拉全量源"的惰性证明)。所有 stage 都是 per-shard 的 `ArrowStage`(无跨 shard 状态),深度优先精确等价。
 - ⬜ **D4 GPU/模型 stage**:文档教在 `__init__` 加载权重(cosmos 会 cloudpickle 整模型,错;应 `setup`);fluent API 无 setup 路径 + 无 `batch_size`。
 - ⬜ **D5 无失败处理**:一个坏文件/行 abort 整 pipeline;`LoadFiles` 仅本地 FS(无 S3/fsspec)。
 

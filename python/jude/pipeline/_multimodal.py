@@ -269,6 +269,11 @@ class RelationPipeline:
         pipeline_config: Any = None,
     ):
         self._input_table: pa.Table | None = None
+        # A thunk returning a FRESH iterator of input shards, for a streaming
+        # source (from_datasource). When set, the local engine pulls one input
+        # shard at a time through all stages (depth-first) — bounded input memory,
+        # never materializing the whole source into one table.
+        self._input_shard_iter: Any = None
         self._read_bytes_source: Any = None  # a DataSource whose bytes are loaded by a stage
         self._stages: list[Any] = []
         self.num_shards = num_shards
@@ -310,18 +315,24 @@ class RelationPipeline:
         """Start from a streaming ``jude.datasource.DataSource``.
 
         Unlike :meth:`from_source` (which eagerly reads all bytes into one
-        table), this streams the source's tasks with bounded memory
-        (``jude.datasource.read_stream``) into the pipeline's input shards — so
-        sources larger than memory (or a streaming video-frame source) feed the
-        multi-stage pipeline without materializing the whole input at once.
+        table), this consumes the source LAZILY: the local engine pulls one
+        input shard (a ``read_stream`` batch of ``batch_rows`` rows) at a time and
+        runs it through the whole stage chain before pulling the next — so the
+        source is never materialized into a single table and input memory is
+        bounded to one shard (see :meth:`run_streaming` for a fully-lazy sink).
+        A larger-than-memory source therefore feeds the pipeline without OOM.
         """
-        import pyarrow as pa
-
-        from jude import datasource
-
         p = cls(**kw)
-        batches = list(datasource.read_stream(source, batch_rows=batch_rows))
-        p._input_table = pa.Table.from_batches(batches) if batches else pa.Table.from_batches([], schema=source.schema())
+        # store a thunk, not a materialized list: run()/run_streaming() call it to
+        # get a fresh iterator each execution (the stream is re-readable per run).
+        def _iter():
+            import pyarrow as pa
+
+            from jude import datasource
+            for b in datasource.read_stream(source, batch_rows=batch_rows):
+                yield pa.Table.from_batches([b])
+        p._input_shard_iter = _iter
+        p._stream_schema = source.schema()
         return p
 
     # ---- stages ----
@@ -362,8 +373,10 @@ class RelationPipeline:
     # ---- execution ----
 
     def _shards(self) -> list[pa.Table]:
+        if self._input_shard_iter is not None:
+            return list(self._input_shard_iter())  # materialize the stream (breadth-first fallback)
         if self._input_table is None:
-            raise ValueError("RelationPipeline has no source; use from_relation/from_table/from_source")
+            raise ValueError("RelationPipeline has no source; use from_relation/from_table/from_source/from_datasource")
         return relation_to_shards(self._input_table, num_shards=self.num_shards, rows_per_shard=self.rows_per_shard)
 
     def _use_cosmos(self) -> bool:
@@ -392,9 +405,12 @@ class RelationPipeline:
 
         use_cosmos = self._use_cosmos()
         engine = "cosmos" if use_cosmos else "local"
-        shards = self._shards()
+        # streaming source + local engine: pull one input shard at a time through
+        # all stages (bounded input memory), never materializing the source.
+        streaming = self._input_shard_iter is not None and not use_cosmos
+        shards = None if streaming else self._shards()
         if not self._stages:
-            return shards_to_table(shards)
+            return shards_to_table(shards if shards is not None else self._shards())
         with observe.query(f"pipeline[{engine}]: {len(self._stages)} stages", kind="pipeline") as q:
             if use_cosmos:
                 # cosmos owns execution + returns only the last stage's output, so
@@ -402,11 +418,30 @@ class RelationPipeline:
                 for st in self._stages:
                     q.stage(type(st).__name__).done()
                 out = self._run_cosmos(shards)
+            elif streaming:
+                out = list(self._iter_local_streaming(self._input_shard_iter(), q))
             else:
                 out = self._run_local(shards, q)  # records the real per-stage funnel
             table = shards_to_table(out)
             q.done(rows=table.num_rows, nbytes=table.nbytes)
             return table
+
+    def run_streaming(self, *, con: Any = None) -> "Iterator[pa.Table]":
+        """Fully-lazy execution: yield output shards one at a time as each input
+        shard is pulled through the whole stage chain. Bounded memory end-to-end
+        (input AND output) — the caller consumes/writes each shard without ever
+        holding the whole result. Local engine only; requires a streaming source
+        (from_datasource) or falls back to iterating the materialized shards.
+
+        Note: stages here are per-shard maps/filters/explodes (the ArrowStage
+        contract), so depth-first streaming is exact; a global-shuffle stage
+        (cross-shard dedup) would need the materialized ``run()`` path instead.
+        """
+        src = self._input_shard_iter() if self._input_shard_iter is not None else iter(self._shards())
+        if not self._stages:
+            yield from src
+            return
+        yield from self._iter_local_streaming(src, None)
 
     def to_relation(self, con: Any = None) -> Any:
         """Execute the pipeline and land the sink as a queryable jude Relation."""
@@ -449,6 +484,47 @@ class RelationPipeline:
                 except Exception:
                     pass
         return data
+
+    def _iter_local_streaming(self, shard_iter: Any, q: Any = None) -> "Iterator[pa.Table]":
+        """Depth-first local engine: run EACH input shard through the whole stage
+        chain before pulling the next, yielding the final stage's output shards.
+        Bounded input memory (one shard in flight, not the whole source). Records
+        the same real per-stage funnel as _run_local (aggregated over the stream).
+        """
+        stages = self._stages
+        for stage in stages:
+            stage.setup(None)
+        handles = [q.stage(type(s).__name__) if q is not None else None for s in stages]
+        rows_acc = [0] * len(stages)
+        bytes_acc = [0] * len(stages)
+        try:
+            for in_shard in shard_iter:
+                current = [in_shard]
+                for i, stage in enumerate(stages):
+                    bs = max(1, int(getattr(stage, "stage_batch_size", 1)))
+                    nxt: list[pa.Table] = []
+                    for start in range(0, len(current), bs):
+                        res = stage.process_data(current[start : start + bs])
+                        if res:
+                            nxt.extend(res)
+                    current = nxt
+                    for t in current:
+                        rows_acc[i] += t.num_rows
+                        bytes_acc[i] += t.nbytes
+                    if not current:
+                        break  # this input shard yielded nothing downstream
+                for t in current:
+                    yield t
+            for i, sh in enumerate(handles):
+                if sh is not None:
+                    sh.progress(rows=rows_acc[i], nbytes=bytes_acc[i])
+                    sh.done()
+        finally:
+            for stage in stages:
+                try:
+                    stage.destroy()
+                except Exception:
+                    pass
 
     def _run_cosmos(self, shards: list[pa.Table]) -> list[pa.Table]:
         """Run on cosmos-xenna: each stage a StageSpec, shards as input_data."""
