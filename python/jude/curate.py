@@ -124,6 +124,7 @@ __all__ = [
     "add_provenance",
     "blend_by_tokens",
     "sample_dropped",
+    "html_to_text",
     # cosmos stages
     "ChunkStage",
     "QualityFilterStage",
@@ -955,6 +956,64 @@ def sample_dropped(
     if len(dropped_idx) > n:
         dropped_idx = sorted(rng.choice(dropped_idx, size=n, replace=False).tolist())
     return before.take(pa.array(dropped_idx, type=pa.int64()))
+
+
+# --- L1.1. HTML -> text extraction -------------------------------------------
+
+import re as _re
+
+_SCRIPT_STYLE = _re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1>", _re.IGNORECASE | _re.DOTALL)
+_TAG = _re.compile(r"<[^>]+>")
+_WS = _re.compile(r"[ \t\r\f\v]+")
+_BLANKS = _re.compile(r"\n\s*\n+")
+
+
+def _html_to_text(html: str, *, engine: str = "builtin") -> str:
+    """Extract readable text from one HTML string. ``engine="resiliparse"`` /
+    ``"trafilatura"`` use those libraries (better boilerplate removal) if
+    installed; ``"builtin"`` (default) is a dependency-free strip: drop
+    script/style, remove tags, unescape entities, collapse whitespace."""
+    if not html:
+        return html
+    if engine == "resiliparse":
+        try:
+            from resiliparse.extract.html2text import extract_plain_text
+
+            return extract_plain_text(html, main_content=True)
+        except ImportError:
+            pass
+    elif engine == "trafilatura":
+        try:
+            import trafilatura
+
+            return trafilatura.extract(html) or ""
+        except ImportError:
+            pass
+    import html as _htmlmod
+
+    s = _SCRIPT_STYLE.sub(" ", html)
+    s = _TAG.sub(" ", s)
+    s = _htmlmod.unescape(s)
+    s = _WS.sub(" ", s)
+    s = _BLANKS.sub("\n", s)
+    return "\n".join(line.strip() for line in s.splitlines() if line.strip())
+
+
+def html_to_text(
+    table: pa.Table,
+    *,
+    column: str = "html",
+    out_column: str = "text",
+    engine: str = "builtin",
+) -> pa.Table:
+    """Extract readable text from an HTML column (the web-pipeline front step):
+    strips script/style + tags + entities (built-in, zero-dep), or delegates to
+    ``resiliparse``/``trafilatura`` for main-content extraction when installed."""
+    texts = [_html_to_text(h or "", engine=engine) for h in _col(table, column)]
+    arr = pa.array(texts, type=pa.string())
+    if out_column in table.column_names:
+        return table.set_column(table.column_names.index(out_column), out_column, arr)
+    return table.append_column(out_column, arr)
 
 
 # --- cosmos pipeline stages --------------------------------------------------

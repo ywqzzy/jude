@@ -17,6 +17,8 @@ dependencies = [
 ray = ["ray>=2.9"]
 pipeline = ["cosmos-xenna>=0.5"]
 multimodal = ["pillow", "soundfile", "numpy"]
+web = ["warcio>=1.7"]          # WARC/WET reading (CommonCrawl); html_to_text has a built-in fallback
+storage = ["s3fs", "gcsfs"]    # object-store URLs (s3://, gs://) via fsspec; MinIO via endpoint_url
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
