@@ -488,7 +488,7 @@ class RayRunner(Runner):
                 # e.g. MEDIAN / PERCENTILE / COUNT(DISTINCT) / STRING_AGG — not a
                 # partial->merge two-phase; run it single-node instead of erroring.
                 return relation.to_arrow()
-            return self.distributed_aggregate(input_rel, partial_sql, final_sql)
+            return self.distributed_aggregate(input_rel, partial_sql, final_sql, list(group))
         jspec = relation.join_spec()
         if jspec is not None and jspec[2] and jspec[3] in ("inner", "left", "right", "outer"):
             left, right, jkeys, how = jspec
@@ -630,13 +630,20 @@ class RayRunner(Runner):
         relation: Any,
         partial_sql: str,
         final_sql: str,
+        group_keys: list | None = None,
     ) -> "pa.Table":
         """Two-phase distributed aggregation.
 
         Each partition computes ``partial_sql`` (over a table named ``part``) on
-        a Ray actor; the driver unions the partials and runs ``final_sql`` (over
-        a table named ``partials``) to merge. Exact for decomposable aggregates
-        (SUM/COUNT/MIN/MAX, and AVG via SUM/COUNT).
+        a Ray actor; the partials are merged with ``final_sql`` (over a table
+        named ``partials``). Exact for decomposable aggregates (SUM/COUNT/MIN/MAX,
+        AVG via SUM/COUNT, STDDEV/VAR via count/sum/sum²).
+
+        When ``group_keys`` are given (a GROUP BY), the final merge is DISTRIBUTED
+        (B2): the partials are hash-shuffled by the group key across bucket
+        workers and ``final_sql`` runs per bucket, so a high-cardinality GROUP BY
+        no longer funnels every group onto the driver. A global aggregate (no
+        group keys) has a one-row result, so it merges on the driver.
         """
         import pyarrow as pa
 
@@ -646,6 +653,23 @@ class RayRunner(Runner):
             workers[self.mgr.worker_for(i)].run_sql_on_table.remote(part, partial_sql)
             for i, part in enumerate(parts)
         ]
+        if group_keys:
+            # distributed final merge: shuffle partials by group key, merge per bucket
+            b = self.mgr.shuffle_bucket_count(None)
+            bucket_workers = self.mgr.shuffle_bucket_workers(None)
+            key_expr = ", ".join(group_keys)
+            bucketed = self._refs_bucketize(refs, key_expr, b, workers)  # [partial][bucket]
+            out_refs = [
+                workers[bucket_workers[j]].sql_on_refs.remote(
+                    [bucketed[p][j] for p in range(len(refs))], final_sql, "partials"
+                )
+                for j in range(b)
+            ]
+            results = [t for t in shim.get(out_refs) if t is not None and t.num_rows > 0]
+            if not results:
+                return relation.to_arrow().slice(0, 0)
+            return pa.concat_tables(results, promote_options="default").combine_chunks()
+
         partial_tables = shim.get(refs)
         if not partial_tables:
             return relation.to_arrow().slice(0, 0)
@@ -917,9 +941,22 @@ class RayRunner(Runner):
             # Both partial and final run over the `part` placeholder (sql_on_refs
             # registers the gathered shards as `part`).
             partial_sql, final_sql = build_two_phase(group, agg_exprs, partial_table="part")
-            # partial per child partition, then single-reducer final merge.
+            # partial per child partition ...
             partials = [workers[self.mgr.worker_for(i)].sql_on_refs.remote([r], partial_sql) for i, r in enumerate(child_refs)]
-            raw = [workers[0].sql_on_refs.remote(partials, final_sql)]
+            if group:
+                # ... then DISTRIBUTE the final merge: shuffle partials by the
+                # group key across buckets, merge per bucket (B2 — a high-
+                # cardinality GROUP BY no longer funnels onto one reducer).
+                bsh = self.mgr.shuffle_bucket_count(None)
+                bw = self.mgr.shuffle_bucket_workers(None)
+                pb = self._refs_bucketize(partials, ", ".join(group), bsh, workers)
+                raw = [
+                    workers[bw[j]].sql_on_refs.remote([pb[p][j] for p in range(len(partials))], final_sql, "part")
+                    for j in range(bsh)
+                ]
+            else:
+                # global aggregate -> one-row result, single reducer is fine.
+                raw = [workers[0].sql_on_refs.remote(partials, final_sql)]
         elif boundary == "Join" and step.get("join_keys") and step.get("how") in ("inner", "left", "right", "outer", "full"):
             left, right = step["children"]
             keys = list(step["join_keys"])

@@ -774,10 +774,11 @@ class _JudeWorker:
         right_t = _realign(pa.concat_tables(rights))
         return self.join_buckets(left_t, right_t, condition, how, keys)
 
-    def sql_on_refs(self, shard_refs: list, sql_template: str) -> "pa.Table":
+    def sql_on_refs(self, shard_refs: list, sql_template: str, table_name: str = "part") -> "pa.Table":
         """General streaming DAG exchange: gather a group of upstream shard refs
         (pulled from the object store, not via the driver), concatenate, and run
-        ``sql_template`` over the result registered as ``part``. This is the
+        ``sql_template`` over the result registered as ``table_name`` (default
+        ``part``; the aggregate final-merge passes ``partials``). This is the
         reducer for a keyed shuffle (Aggregate/Order/Distinct final merge) and the
         per-partition local-region apply. Returns one Arrow table."""
         import pyarrow as pa
@@ -790,13 +791,13 @@ class _JudeWorker:
             base = next((t for t in allrefs if t is not None), None)
             if base is None:
                 return pa.table({})
-            self._conn.register("part", base.slice(0, 0).combine_chunks())
+            self._conn.register(table_name, base.slice(0, 0).combine_chunks())
         else:
-            self._conn.register("part", _realign(pa.concat_tables(shards)))
+            self._conn.register(table_name, _realign(pa.concat_tables(shards)))
         try:
             return self._conn.sql(sql_template).to_arrow()
         finally:
-            self._conn.unregister("part")
+            self._conn.unregister(table_name)
 
     def setop_on_refs(self, left_refs: list, right_refs: list, kw: str) -> "pa.Table":
         """Reducer for a distributed set operation: gather this bucket's left and
