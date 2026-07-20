@@ -53,6 +53,31 @@ def _runner(runner: Any = None) -> Any:
     return get_or_create_runner()
 
 
+class _UnionFind:
+    """Disjoint-set with path compression and **union-by-min**: a component's
+    root is always its smallest member index. Fed incrementally so the driver
+    never holds the whole edge set (L2.1). Union-by-min makes the survivor the
+    lowest row index, matching single-node fuzzy_dedup's keep-lowest semantics."""
+
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+
+    def find(self, x: int) -> int:
+        root = x
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[x] != root:  # path compression
+            self.parent[x], x = root, self.parent[x]
+        return root
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        lo, hi = (ra, rb) if ra < rb else (rb, ra)
+        self.parent[hi] = lo  # smaller index becomes the root
+
+
 def dist_map(table: pa.Table, op: str, *, runner: Any = None, **kwargs: Any) -> pa.Table:
     """Apply a map-style curator to a table, distributed: partition -> per-shard
     apply on workers -> concat. `op` is a jude.curate/curate_mm function name."""
@@ -194,15 +219,23 @@ def dist_fuzzy_dedup(
         for bkt in range(b)
     ]
     n = table.num_rows
-    pairs: list = []
-    for et in shim.get(edge_refs):
+    # L2.1: stream each bucket's edges into an incremental union-find instead of
+    # collecting EVERY edge on the driver then running one CC pass. Peak driver
+    # memory is the label array (n) + one bucket's edges at a time, not the whole
+    # edge set — so a high-dup corpus with a huge edge count doesn't blow the
+    # driver. union-by-min keeps the lowest row index as each cluster's
+    # representative (matches single-node fuzzy_dedup's keep-lowest semantics).
+    uf = _UnionFind(n)
+    for ref in edge_refs:
+        et = shim.get([ref])[0]           # resolve one bucket at a time (streamed)
         if et is None or et.num_rows == 0:
             continue
         aa = et.column("a").to_pylist()
         bb = et.column("b").to_pylist()
-        pairs.extend(zip(aa, bb))
-    # one global connected-components over the whole corpus's near-dup graph
-    reps = _curate.connected_components(n, pairs)
+        for a, b in zip(aa, bb):
+            uf.union(a, b)
+        del et, aa, bb                    # free this bucket's edges before the next
+    reps = [uf.find(i) for i in range(n)]
     if keep_cluster:
         return table.append_column("dup_cluster", pa.array(reps, type=pa.int64())).combine_chunks()
     keep = [i for i in range(n) if reps[i] == i]
