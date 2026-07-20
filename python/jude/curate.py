@@ -370,23 +370,62 @@ def semantic_dedup(
     existing embedding column (produce it with ``jude.ai.embed_text`` or any
     embedder). ``keep_cluster`` annotates ``sem_cluster`` instead of dropping.
 
-    This runs the O(n^2) clustering over the WHOLE table; for scale, first bucket
-    by a coarse cluster / Lance ANN (jude's vector stack) so each group is small,
-    then apply per-group. jude's Lance IVF/HNSW index makes that bucketing cheap
-    — the semantic-dedup advantage over engines without a vector stack.
+    Dedup is GREEDY and non-transitive: a row is dropped only when it is within
+    ``threshold`` cosine of an already-KEPT survivor (mapped to that survivor).
+    This is the SemDeDup semantics — it does NOT chain A~B~C into one cluster
+    when A and C are dissimilar (the old transitive connected-components merged
+    them, over-deduplicating). Runs O(n * survivors); for scale, cluster first
+    (``jude.cluster.semantic_dedup_clustered``) so each group is small — jude's
+    Lance IVF/HNSW index makes that bucketing cheap.
     """
     if embedding_column not in table.column_names:
         raise KeyError(f"embedding column {embedding_column!r} not in table")
     raw = table.column(embedding_column).to_pylist()
-    embs = [list(v) if v is not None else [] for v in raw]
-    n = len(embs)
+    n = len(raw)
     if n == 0:
         return table
-    reps = _curate.semantic_clusters(embs, threshold)
+    reps = _greedy_semantic_reps(raw, threshold)
     if keep_cluster:
         return table.append_column("sem_cluster", pa.array(reps, type=pa.int64()))
     keep = [i for i in range(n) if reps[i] == i]
     return table.take(pa.array(keep, type=pa.int64()))
+
+
+def _greedy_semantic_reps(raw: list, threshold: float) -> list:
+    """Greedy non-transitive SemDeDup: walk rows in order; a row joins the first
+    already-kept survivor within ``threshold`` cosine (mapped to it), else it
+    becomes a new survivor. Returns reps[i] = survivor index for row i (== i if
+    kept). Null / wrong-dim embeddings are treated as distinct (never dropped)."""
+    import numpy as np
+
+    n = len(raw)
+    reps = list(range(n))
+    dim = next((len(v) for v in raw if v), 0)
+    if dim == 0:
+        return reps  # no usable embeddings -> all distinct
+    kept_idx: list[int] = []
+    kept_vecs: list = []  # unit-normalized survivor vectors
+    kept_mat = None
+    for i, v in enumerate(raw):
+        if not v or len(v) != dim:
+            kept_idx.append(i)  # unusable embedding -> its own survivor
+            vv = np.zeros(dim, dtype="float32")
+            kept_vecs.append(vv)
+            kept_mat = np.vstack([kept_mat, vv]) if kept_mat is not None else vv[None, :]
+            continue
+        vec = np.asarray(v, dtype="float32")
+        nrm = float(np.linalg.norm(vec)) or 1.0
+        vec = vec / nrm
+        if kept_mat is not None:
+            sims = kept_mat @ vec
+            j = int(np.argmax(sims))
+            if sims[j] >= threshold:
+                reps[i] = kept_idx[j]  # dropped -> nearest survivor
+                continue
+        kept_idx.append(i)
+        kept_vecs.append(vec)
+        kept_mat = np.vstack([kept_mat, vec]) if kept_mat is not None else vec[None, :]
+    return reps
 
 
 # --- C4. language identification ---------------------------------------------
