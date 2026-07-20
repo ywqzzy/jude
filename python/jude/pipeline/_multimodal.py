@@ -443,6 +443,39 @@ class RelationPipeline:
             return
         yield from self._iter_local_streaming(src, None)
 
+    def write_streaming(self, path: str, *, fmt: str = "lance", **storage_options: Any) -> dict:
+        """Execute the pipeline and WRITE each output shard as it is produced —
+        bounded memory end to end (L0.3): the source is streamed in shard by
+        shard, each output shard is written out and freed, so neither the whole
+        input nor the whole output is ever held. ``fmt="lance"`` appends each
+        shard to one Lance dataset at ``path``; ``fmt="parquet"`` writes numbered
+        parquet shards (``path/part-00000.parquet`` …) to any fsspec URL
+        (local / s3:// MinIO). Returns a manifest (shards written, rows)."""
+        shards = 0
+        rows = 0
+        if fmt == "lance":
+            from jude import _lance
+
+            for i, shard in enumerate(self.run_streaming()):
+                if shard.num_rows == 0:
+                    continue
+                _lance.write(shard, path, mode="create" if shards == 0 else "append")
+                shards += 1
+                rows += shard.num_rows
+        elif fmt == "parquet":
+            from jude import storage
+
+            for i, shard in enumerate(self.run_streaming()):
+                if shard.num_rows == 0:
+                    continue
+                storage.write_parquet(shard, f"{path.rstrip('/')}/part-{i:05d}.parquet",
+                                     **storage_options)
+                shards += 1
+                rows += shard.num_rows
+        else:
+            raise ValueError(f"unknown fmt {fmt!r}; use 'lance' or 'parquet'")
+        return {"path": path, "format": fmt, "shards": shards, "rows": rows}
+
     def to_relation(self, con: Any = None) -> Any:
         """Execute the pipeline and land the sink as a queryable jude Relation."""
         if con is None:
