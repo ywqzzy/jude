@@ -313,6 +313,37 @@ fn contamination_batch(texts: Vec<Option<String>>, benchmark: Vec<u64>, ngram: u
         .collect()
 }
 
+/// Per-example benchmark n-gram sets (one hash list per benchmark example), for
+/// dilution-resistant contamination scoring via `contamination_coverage_batch`.
+#[pyfunction]
+#[pyo3(signature = (texts, ngram=8))]
+fn benchmark_ngram_sets(texts: Vec<String>, ngram: usize) -> Vec<Vec<u64>> {
+    texts
+        .iter()
+        .map(|t| curate::ngram_hashes(t, ngram))
+        .collect()
+}
+
+/// Dilution-resistant contamination of each doc: the max fraction of ANY single
+/// benchmark example's n-grams present in the doc (so a benchmark question
+/// buried in a long doc still scores ~1.0). `example_sets` is from
+/// `benchmark_ngram_sets`.
+#[pyfunction]
+#[pyo3(signature = (texts, example_sets, ngram=8))]
+fn contamination_coverage_batch(
+    texts: Vec<Option<String>>,
+    example_sets: Vec<Vec<u64>>,
+    ngram: usize,
+) -> Vec<f64> {
+    texts
+        .into_iter()
+        .map(|t| {
+            t.map(|s| curate::contamination_coverage(&curate::ngram_hashes(&s, ngram), &example_sets))
+                .unwrap_or(0.0)
+        })
+        .collect()
+}
+
 // ---- C17. Multimodal (image) curation ----
 
 /// Perceptual hash of one decoded image (H*W*C u8 flat). `kind` = "phash" |
@@ -408,6 +439,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_pii, m)?)?;
     m.add_function(wrap_pyfunction!(benchmark_ngrams, m)?)?;
     m.add_function(wrap_pyfunction!(contamination_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(benchmark_ngram_sets, m)?)?;
+    m.add_function(wrap_pyfunction!(contamination_coverage_batch, m)?)?;
     m.add_function(wrap_pyfunction!(kmeans_assign_accumulate, m)?)?;
     m.add_function(wrap_pyfunction!(kmeans_assign_labels, m)?)?;
     Ok(())

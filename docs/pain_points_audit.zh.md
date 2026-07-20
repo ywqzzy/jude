@@ -11,7 +11,7 @@
 - ⬜ **A2 分布式 BM25 比较分片本地分数** → 全局排序错。`distributed_fts` 用 `_score DESC` 归并(`vector.py:737`),但每片 BM25 用各自的 IDF+avgdl。修法:一次 map-reduce 预扫收集全局 `N`/`df`/`avgdl` 再重打分。
 - 🔧 **A3 分布式 fuzzy dedup 只按第一个 band 路由 + 无跨桶连通分量** → 已修:producer 改为**按所有 band 路由**(每行对它的每个 band key 各发一份到对应桶,只搬 `(rid, bandkey, sig)` 不搬整行);reducer 在桶内按 band key 分组验 Jaccard≥threshold → 产出**边**(rid 对);driver 对全语料跑**一次全局连通分量**(union-find)再每簇留一行 —— 与单机 `curate.fuzzy_dedup` **召回逐行一致**(含跨桶传递簇 A~B~C)。测试 `test_distributed_fuzzy_dedup.py`(3:召回 parity、传递簇、cluster label parity)。
 - 🔧 **A4 快/分布式向量路径硬编码整数 id** → 已修:新增 `_id_key`(不再 `int(x)` 强转),`_resident_vectors`/`knn_ann_resident`/`_decode_shard`/`vector_exact_shard(_batch)`/`vector_knn_shard` 全部接 `id_column` 参数并**保留原生 id 类型**(int/str/UUID);`distributed_knn_resident(_batch)`/`distributed_ann_knn` 透传 `id_column`;`knn_rerank` 的 `id_column` 从死参变为"payload 恒含 id 列"。测试 `test_vector_string_ids.py`(3,含分布式)。待办:resident 路径的 payload 列直返(目前 payload 走 `knn_rerank` 的 `columns`)。
-- ⬜ **A5 `semantic_dedup` 阈值图传递闭包**(A~B~C 链式合并)+ 全表 O(n²) 单机(`curate.rs:498-515`,`curate.py:305`)→ 过度合并、不 scale。已有 Rust kmeans(`curate_py.rs:363`)未接线。修法:聚类内按质心去重(真 SemDeDup)。
+- 🔧 **A5 `semantic_dedup` 阈值图传递闭包**(A~B~C 链式合并)+ 全表 O(n²) → 已修:改为**贪心非传递** SemDeDup(`_greedy_semantic_reps`:一行只在与某个**已保留 survivor** 的 cosine≥threshold 时才丢弃并映射到它,不再连通分量传递合并);null/维度不符的 embedding 视为独立。`cluster.semantic_dedup_clustered`(kmeans 分簇后簇内去重)已存在负责 scale。测试 `test_semantic_dedup_greedy.py`(4:非传递链保留端点、近重仍合并、null 独立、cluster label)。
 
 ## 🟠 B. 规模悬崖(号称分布式,实卡单机)
 
@@ -26,9 +26,9 @@
 - ⬜ **C1 缺 web 管线前半**:无 HTML/boilerplate 抽取、无行级 dedup、无精确子串/后缀数组 dedup、无 WARC 读(`llm_data_engine_plan.zh.md:52,118`)。
 - ⬜ **C2 quality 欠 Gopher/C4**:缺重复 n-gram 家族、stopword 门、C4 行过滤、blocklist;`digit_ratio` 等三信号算了不用(死信号,`curate.rs:792-818`);无 perplexity/fastText 质量分。
 - 🔧 **C3 LSH bands 不按 threshold 校准** → 已修:新增 `optimal_lsh_bands(threshold, num_hashes)`(datasketch 式最小化假阳+假阴面积,得 S 曲线 crossover≈threshold);`fuzzy_dedup`/`dist_fuzzy_dedup` 的 `bands` 默认 `None` → 按 threshold 自动校准(旧固定 16 只在 ~0.7 附近才准,别的阈值静默丢召回)。显式传 `bands` 仍可覆盖。测试 `test_lsh_calibration.py`(3:crossover 单调贴合、低阈值召回 ≥ 固定 16、显式覆盖)。默认 `ngram=2` 仍偏小(判断项,暂留以免动既有行为)。
-- ⬜ **C4 语言识别** 6 语启发式,日文 kanji 误判成 zh(`curate.rs:138`);无 fastText lid.176。
+- 🟡 **C4 语言识别** 6 语启发式,置信度已修:改为**边际式**(winner_hits/total_hits)—— 明显英文不再得 ~0.08(旧的绝对停用词覆盖),`language_filter(min_confidence=.5)` 不再误删英文;日文带假名正确识别为 ja。纯 kanji 仍可能误判 zh(启发式边界,无 fastText lid.176)。
 - ⬜ **C5 多模态 curation 仅图像 pHash + 浅质量**;无 CLIP-score/NSFW/aesthetic、无音频、无视频级 dedup;`image_dedup` 单机 + 硬编码 `bands=4`。
-- ⬜ **C6 PII 无 Luhn/NER**(任意 9 位=SSN,`curate.rs:358`);去污染用文档侧比例(长文稀释,`curate.rs:399-411`)+ 合并 benchmark 边界。tokenizer-aware 长度缺(C15)。
+- 🔧 **C6 PII Luhn + 去污染稀释** → 已修:credit_card 现在必须过 **Luhn 校验**(`4111...` 命中、任意 16 位 `1234...` 不再误报);去污染 (C11) 改为**抗稀释的 benchmark 侧覆盖**(`contamination_coverage`:doc 含某条完整 benchmark → ~1.0,不再被长文稀释成 0),旧 doc 侧比例函数保留兼容。tokenizer-aware 长度 (C15)、NER 仍待办。测试 `test_curate_quality_fixes.py`(10)+ Rust `credit_card_requires_luhn`/`contamination_coverage_resists_dilution`。
 
 ## 🟢 D. Pipeline
 

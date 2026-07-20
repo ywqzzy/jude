@@ -548,12 +548,19 @@ def decontaminate(
     reason_column: str | None = None,
 ) -> pa.Table:
     """Remove training docs contaminated by benchmark/eval examples (C11): a doc
-    whose n-gram overlap with the benchmark set exceeds ``threshold`` is dropped
-    (prevents eval leakage / benchmark gaming). ``benchmark_texts`` are the eval
-    questions/answers. If ``reason_column`` is set, keep all rows and annotate
-    the contamination ratio instead of dropping."""
-    bench = _curate.benchmark_ngrams(list(benchmark_texts), ngram)
-    ratios = _curate.contamination_batch(_col(table, column), bench, ngram)
+    is dropped when its contamination score exceeds ``threshold`` (prevents eval
+    leakage / benchmark gaming). ``benchmark_texts`` are the eval questions.
+
+    The score is DILUTION-RESISTANT: it is the maximum fraction of any single
+    benchmark example's n-grams present in the doc (benchmark-side coverage), so
+    a benchmark question buried in a long document still scores ~1.0 — unlike a
+    doc-side ratio (matches / doc n-grams), which a long doc dilutes toward 0 and
+    lets leakage slip through. Use ``ngram`` <= the shortest benchmark example's
+    word count. If ``reason_column`` is set, keep all rows and annotate the score
+    instead of dropping.
+    """
+    example_sets = _curate.benchmark_ngram_sets(list(benchmark_texts), ngram)
+    ratios = _curate.contamination_coverage_batch(_col(table, column), example_sets, ngram)
     if reason_column is not None:
         return table.append_column(reason_column, pa.array(ratios, type=pa.float64()))
     keep = [i for i, r in enumerate(ratios) if r <= threshold]

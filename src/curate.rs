@@ -220,19 +220,23 @@ fn lang_by_stopwords(text: &str) -> (String, f64) {
     }
     let wordset: std::collections::HashSet<&str> = words.iter().map(|s| s.as_str()).collect();
     let mut best = ("en", 0usize);
+    let mut total_hits = 0usize;
     for (lang, stops) in SETS {
         let hits = stops.iter().filter(|s| wordset.contains(**s)).count();
+        total_hits += hits;
         if hits > best.1 {
             best = (lang, hits);
         }
     }
-    // confidence: fraction of the winner's stopwords seen (coarse)
-    let denom = SETS
-        .iter()
-        .find(|(l, _)| *l == best.0)
-        .map(|(_, s)| s.len())
-        .unwrap_or(12) as f64;
-    (best.0.to_string(), (best.1 as f64 / denom).min(1.0))
+    // confidence: how DOMINANT the winner is among stopword hits (margin), not
+    // the absolute fraction of one language's sentinel words — a clearly-English
+    // sentence with few of the 12 sentinels should still score high, not ~0.08.
+    let conf = if best.1 == 0 {
+        0.0
+    } else {
+        (best.1 as f64 / total_hits as f64).min(1.0)
+    };
+    (best.0.to_string(), conf)
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +342,36 @@ pub fn detect_pii(text: &str) -> Vec<PiiSpan> {
     spans
 }
 
+fn luhn_ok(tok: &str) -> bool {
+    // Luhn checksum over the ascii digits in `tok` (ignores separators). A real
+    // credit-card number passes; a random 13-16 digit run almost never does, so
+    // this removes the bulk of credit_card false positives.
+    let digits: Vec<u32> = tok
+        .bytes()
+        .filter(|b| b.is_ascii_digit())
+        .map(|b| (b - b'0') as u32)
+        .collect();
+    if digits.len() < 13 {
+        return false;
+    }
+    // standard Luhn: walk right-to-left, double every SECOND digit (the check
+    // digit itself is not doubled), subtract 9 if the doubled value exceeds 9.
+    let mut sum = 0u32;
+    let mut double = false;
+    for &d in digits.iter().rev() {
+        let mut v = d;
+        if double {
+            v *= 2;
+            if v > 9 {
+                v -= 9;
+            }
+        }
+        sum += v;
+        double = !double;
+    }
+    sum % 10 == 0
+}
+
 fn classify_digit_token(tok: &str, digits: usize) -> Option<&'static str> {
     // IPv4: 4 dot-separated groups, each 1-3 digits <=255
     let dot_parts: Vec<&str> = tok.split('.').collect();
@@ -351,7 +385,9 @@ fn classify_digit_token(tok: &str, digits: usize) -> Option<&'static str> {
         return Some("ipv4");
     }
     match digits {
-        13..=16 => Some("credit_card"),
+        // a 13-16 digit run is a credit card only if it passes the Luhn check
+        // (else it's just a long number — don't flag it).
+        13..=16 if luhn_ok(tok) => Some("credit_card"),
         11..=12 => Some("phone"),
         10 => Some("phone"),
         9 => Some("ssn"),
@@ -408,6 +444,31 @@ pub fn contamination_ratio(
         .filter(|h| benchmark_set.contains(h))
         .count();
     hit as f64 / doc_ngrams.len() as f64
+}
+
+/// Dilution-resistant contamination: the maximum fraction of ANY single
+/// benchmark example's n-grams that appear in the doc. Unlike
+/// `contamination_ratio` (doc-side: matches / doc n-grams — which a long doc
+/// dilutes toward 0), this is benchmark-side, so a doc that CONTAINS a full
+/// benchmark question scores ~1.0 regardless of how much other text surrounds
+/// it. Each element of `example_sets` is one benchmark example's n-gram hashes.
+pub fn contamination_coverage(doc_ngrams: &[u64], example_sets: &[Vec<u64>]) -> f64 {
+    if doc_ngrams.is_empty() || example_sets.is_empty() {
+        return 0.0;
+    }
+    let doc: std::collections::HashSet<u64> = doc_ngrams.iter().copied().collect();
+    let mut best = 0.0f64;
+    for ex in example_sets {
+        if ex.is_empty() {
+            continue; // example shorter than n -> can't fingerprint at this n
+        }
+        let hit = ex.iter().filter(|h| doc.contains(h)).count();
+        let cov = hit as f64 / ex.len() as f64;
+        if cov > best {
+            best = cov;
+        }
+    }
+    best
 }
 
 /// Union-Find (disjoint set) for clustering near-duplicate ids into components.
@@ -1109,6 +1170,20 @@ mod tests {
     }
 
     #[test]
+    fn credit_card_requires_luhn() {
+        // 4111111111111111 passes Luhn -> credit_card; 1234567812345678 fails ->
+        // not flagged (no false positive on an arbitrary 16-digit run).
+        assert!(luhn_ok("4111111111111111"));
+        assert!(!luhn_ok("1234567812345678"));
+        let good_spans = detect_pii("pay 4111 1111 1111 1111");
+        let good: Vec<&str> = good_spans.iter().map(|s| s.kind.as_str()).collect();
+        assert!(good.contains(&"credit_card"), "kinds={good:?}");
+        let bad_spans = detect_pii("order 1234567812345678");
+        let bad: Vec<&str> = bad_spans.iter().map(|s| s.kind.as_str()).collect();
+        assert!(!bad.contains(&"credit_card"), "kinds={bad:?}");
+    }
+
+    #[test]
     fn redact_pii_replaces() {
         let (out, count) = redact_pii("email a@b.com and ip 10.0.0.1 here");
         assert!(count >= 2, "count={count} out={out}");
@@ -1139,5 +1214,23 @@ mod tests {
         let clean = "rust systems programming with memory safety and zero cost abstractions";
         let r2 = contamination_ratio(&ngram_hashes(clean, 3), &bset);
         assert!(r2 < 0.05, "r2={r2}");
+    }
+
+    #[test]
+    fn contamination_coverage_resists_dilution() {
+        let bench = "what is the capital of france";
+        let example = vec![ngram_hashes(bench, 3)];
+        // the benchmark question buried in a LONG doc: doc-side ratio dilutes to
+        // ~0, but coverage stays ~1.0 (the full question's n-grams are present).
+        let padding = "lorem ipsum dolor sit amet ".repeat(200);
+        let long_doc = format!("{bench} {padding}");
+        let dn = ngram_hashes(&long_doc, 3);
+        let ratio = contamination_ratio(&dn, &example[0].iter().copied().collect());
+        let cov = contamination_coverage(&dn, &example);
+        assert!(ratio < 0.2, "diluted doc-side ratio should be small: {ratio}");
+        assert!(cov > 0.9, "coverage should catch the buried question: {cov}");
+        // an unrelated long doc -> coverage ~0
+        let clean = "rust systems programming ".repeat(50);
+        assert!(contamination_coverage(&ngram_hashes(&clean, 3), &example) < 0.05);
     }
 }
