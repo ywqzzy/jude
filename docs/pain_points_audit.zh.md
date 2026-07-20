@@ -27,7 +27,7 @@
 - 🔧 **C2 quality 欠 Gopher/C4** → 部分修:新增 **stopword 门**(`stopword_ratio` + `min_stopword_ratio`=0.06:够长的文档若停用词太少→关键词垃圾,拒)、**重复 n-gram**(`dup_ngram_ratio` = 重复 word-3gram 占比 + `max_dup_ngram_ratio`=0.30)、**激活死信号 digit_ratio**(`max_digit_ratio`=0.30)。三者接进 `quality_reject_reason` + Python 阈值 kwargs + `quality_signals` 列。测试 `test_quality_gopher.py`(6)+ Rust 3 个单测。仍待办:C4 行级过滤(去无标点行/JS/cookie 提示)、blocklist、perplexity/fastText 质量分。
 - 🔧 **C3 LSH bands 不按 threshold 校准** → 已修:新增 `optimal_lsh_bands(threshold, num_hashes)`(datasketch 式最小化假阳+假阴面积,得 S 曲线 crossover≈threshold);`fuzzy_dedup`/`dist_fuzzy_dedup` 的 `bands` 默认 `None` → 按 threshold 自动校准(旧固定 16 只在 ~0.7 附近才准,别的阈值静默丢召回)。显式传 `bands` 仍可覆盖。测试 `test_lsh_calibration.py`(3:crossover 单调贴合、低阈值召回 ≥ 固定 16、显式覆盖)。默认 `ngram=2` 仍偏小(判断项,暂留以免动既有行为)。
 - 🟡 **C4 语言识别** 6 语启发式,置信度已修:改为**边际式**(winner_hits/total_hits)—— 明显英文不再得 ~0.08(旧的绝对停用词覆盖),`language_filter(min_confidence=.5)` 不再误删英文;日文带假名正确识别为 ja。纯 kanji 仍可能误判 zh(启发式边界,无 fastText lid.176)。
-- ⬜ **C5 多模态 curation 仅图像 pHash + 浅质量**;无 CLIP-score/NSFW/aesthetic、无音频、无视频级 dedup;`image_dedup` 单机 + 硬编码 `bands=4`。
+- 🟡 **C5 多模态 curation** → 部分修:`image_dedup` 的 `bands` 从硬编码 4 改为**可配参数**(更多 band = 更高召回,配合 max_distance 调)。测试 `test_image_dedup.py`(4)。**明确边界(不做)**:CLIP-score/NSFW/aesthetic 是**模型推理**——按 jude 定位属"AI/LLM 推理"范畴,由用户以 UDF 提供,不在引擎内实现。待办(数据侧、可做):分布式 image_dedup(按 A3 edges+CC 模式)、音频/视频级 dedup。
 - 🔧 **C6 PII Luhn + 去污染稀释** → 已修:credit_card 现在必须过 **Luhn 校验**(`4111...` 命中、任意 16 位 `1234...` 不再误报);去污染 (C11) 改为**抗稀释的 benchmark 侧覆盖**(`contamination_coverage`:doc 含某条完整 benchmark → ~1.0,不再被长文稀释成 0),旧 doc 侧比例函数保留兼容。tokenizer-aware 长度 (C15)、NER 仍待办。测试 `test_curate_quality_fixes.py`(10)+ Rust `credit_card_requires_luhn`/`contamination_coverage_resists_dilution`。
 
 ## 🟢 D. Pipeline

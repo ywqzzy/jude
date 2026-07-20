@@ -88,15 +88,19 @@ def image_dedup(
     column: str = "image",
     kind: str = "phash",
     max_distance: int = 6,
+    bands: int = 4,
     keep_cluster: bool = False,
 ) -> pa.Table:
     """Remove near-duplicate images via perceptual hashing. Images whose hashes
     are within ``max_distance`` Hamming bits are the same picture (resized /
     recompressed / lightly edited) and collapse to one (lowest row index).
 
-    Uses hash-prefix bucketing to avoid O(n^2): images sharing a hash prefix are
-    candidates, verified by exact Hamming distance, then union-found into
-    clusters. ``keep_cluster`` annotates ``img_cluster`` instead of dropping.
+    Uses hash-prefix bucketing to avoid O(n^2): the hex hash is split into
+    ``bands`` windows and images sharing ANY window are candidates, verified by
+    exact Hamming distance, then union-found into clusters. More ``bands`` = more
+    recall (tolerates differences in more windows) at more candidate pairs; tune
+    it with ``max_distance``. ``keep_cluster`` annotates ``img_cluster`` instead
+    of dropping.
     """
     hashes = _hash_column(table, column, kind)
     n = len(hashes)
@@ -105,7 +109,7 @@ def image_dedup(
     # LSH-style banding on the hex hash: split into `bands` windows; images
     # sharing ANY window are candidates. This tolerates differences outside a
     # window (a single-prefix bucket would miss near-dups that differ early).
-    bands = 4
+    bands = max(1, int(bands))
     buckets: dict[tuple, list[int]] = {}
     for i, h in enumerate(hashes):
         if h is None:
