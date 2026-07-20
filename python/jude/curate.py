@@ -117,6 +117,7 @@ __all__ = [
     "decontaminate",
     "c4_line_filter",
     "corpus_line_dedup",
+    "substring_dedup",
     # cosmos stages
     "ChunkStage",
     "QualityFilterStage",
@@ -666,6 +667,74 @@ def corpus_line_dedup(
         kept = [ln for ln in txt.splitlines()
                 if not (key(ln) and doc_freq.get(key(ln), 0) >= min_docs)]
         out_texts.append("\n".join(kept))
+    arr = pa.array(out_texts, type=pa.string())
+    if dst in table.column_names:
+        return table.set_column(table.column_names.index(dst), dst, arr)
+    return table.append_column(dst, arr)
+
+
+# --- C1b. exact-substring dedup (Lee et al. — rolling-hash form) -------------
+
+_MOD_61 = (1 << 61) - 1
+_POLY_B = 1_000_003
+
+
+def _token_hashes(tokens: list[str]) -> list[int]:
+    import hashlib
+
+    return [int.from_bytes(hashlib.blake2b(t.encode("utf-8", "ignore"), digest_size=8).digest(),
+                           "little") % _MOD_61 for t in tokens]
+
+
+def substring_dedup(
+    table: pa.Table,
+    *,
+    column: str = "text",
+    out_column: str | None = None,
+    k: int = 50,
+) -> pa.Table:
+    """Exact-substring dedup (C1, Lee et al. 2021 — practical rolling-hash form):
+    remove any span of ``k`` or more consecutive tokens that has ALREADY appeared
+    earlier in the corpus (the first occurrence is kept). This strips shared
+    passages — license headers, boilerplate paragraphs, quoted/copied text — that
+    fuzzy/exact *document* dedup misses because the surrounding documents differ.
+
+    A 64-bit polynomial rolling hash over per-token hashes finds repeated
+    ``k``-token windows in O(total tokens); every token covered only by a
+    repeated window is dropped and the survivors are rejoined (whitespace-
+    tokenized). Documents shorter than ``k`` tokens pass through unchanged.
+    Sequential over the corpus (first occurrence wins), so it's deterministic.
+    """
+    dst = out_column or column
+    seen: set[int] = set()
+    bk = pow(_POLY_B, k - 1, _MOD_61)  # B^(k-1) mod M, for rolling the window
+    out_texts: list = []
+    for txt in _col(table, column):
+        if not txt:
+            out_texts.append(txt)
+            continue
+        toks = txt.split()
+        n = len(toks)
+        if n < k:
+            out_texts.append(txt)
+            continue
+        th = _token_hashes(toks)
+        dup = [False] * n
+        # initial window hash over tokens [0, k)
+        h = 0
+        for j in range(k):
+            h = (h * _POLY_B + th[j]) % _MOD_61
+        for i in range(0, n - k + 1):
+            if i > 0:
+                # roll: drop token i-1, add token i+k-1
+                h = ((h - th[i - 1] * bk) * _POLY_B + th[i + k - 1]) % _MOD_61
+            if h in seen:
+                for j in range(i, i + k):
+                    dup[j] = True
+            else:
+                seen.add(h)
+        kept = [toks[i] for i in range(n) if not dup[i]]
+        out_texts.append(" ".join(kept))
     arr = pa.array(out_texts, type=pa.string())
     if dst in table.column_names:
         return table.set_column(table.column_names.index(dst), dst, arr)
