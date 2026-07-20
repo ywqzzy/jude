@@ -721,17 +721,20 @@ def distributed_fts(
     *,
     k: int = 10,
     columns: Any = None,
+    global_idf: bool = True,
+    overfetch: int = 5,
     runner: Any = None,
 ) -> "pa.Table":
     """Distributed BM25 full-text search. Each shard is a Lance dataset with an
-    INVERTED index on ``column``; the query fans out to all shards, each returns
-    its local top-``k`` by ``_score``, and the driver merges to the global
-    top-``k``. The keyword-retrieval counterpart to ``distributed_ann_knn`` —
-    together they give distributed hybrid RAG.
+    INVERTED index on ``column``; the query fans out to all shards.
 
-    Correctness note: BM25 scores are computed per shard (IDF is shard-local), so
-    the global ranking approximates a single-corpus BM25 — fine for RAG recall;
-    exact global IDF would need a term-stat pre-pass.
+    With ``global_idf`` (default), ranking is EXACT across the whole corpus: a
+    term-stat pre-pass collects corpus-wide document count / document frequency /
+    average length, then each shard's local top-``k*overfetch`` candidates are
+    rescored with GLOBAL BM25 and merged. Without it, shard-local ``_score`` is
+    merged directly (faster, but a term rare globally yet common in one shard is
+    mis-ranked — the shard-local-IDF approximation). The keyword-retrieval
+    counterpart to ``distributed_ann_knn``.
     """
     r = runner
     if r is None:
@@ -740,22 +743,75 @@ def distributed_fts(
         r = get_or_create_runner()
     from jude.runners import _ray_shim as shim
 
-    want = list(dict.fromkeys(list(columns))) if columns is not None else None
     workers = r._ensure_workers()
-    refs = [
-        workers[r.mgr.worker_for(i)].fts_shard.remote(path, column, str(query), k, want)
+
+    if not global_idf:
+        want = list(dict.fromkeys(list(columns))) if columns is not None else None
+        refs = [
+            workers[r.mgr.worker_for(i)].fts_shard.remote(path, column, str(query), k, want)
+            for i, path in enumerate(shard_paths)
+        ]
+        locals_ = [t for t in shim.get(refs) if t is not None and t.num_rows > 0]
+        if not locals_:
+            return pa.table({})
+        import jude
+
+        merged = pa.concat_tables(locals_).combine_chunks()
+        con = jude.connect()
+        con.register("_m", merged)
+        order = "_score DESC" if "_score" in merged.column_names else "1"
+        return con.sql(f"SELECT * FROM _m ORDER BY {order} LIMIT {int(k)}").to_arrow()
+
+    # --- exact global-IDF two-pass ---
+    from jude import _bm25
+
+    terms = _bm25.query_terms(query)
+    if not terms:
+        return pa.table({})
+    # pass 1: corpus-wide term stats
+    stat_refs = [
+        workers[r.mgr.worker_for(i)].fts_termstats.remote(path, column, terms)
         for i, path in enumerate(shard_paths)
     ]
-    locals_ = [t for t in shim.get(refs) if t is not None and t.num_rows > 0]
-    if not locals_:
+    n_docs = 0
+    total_tokens = 0
+    df: dict = {t: 0 for t in terms}
+    for res in shim.get(stat_refs):
+        if res is None:
+            continue
+        nd, tot, dfl = res
+        n_docs += nd
+        total_tokens += tot
+        for t in terms:
+            df[t] += dfl.get(t, 0)
+    if n_docs == 0:
         return pa.table({})
-    import jude
+    avgdl = total_tokens / n_docs
+    idfs = {t: _bm25.idf(n_docs, df[t]) for t in terms}
+    # pass 2: local candidates with tf + doc length, rescored globally
+    cand_k = max(k, k * max(1, overfetch))
+    want = list(dict.fromkeys(list(columns))) if columns is not None else None
+    cand_refs = [
+        workers[r.mgr.worker_for(i)].fts_candidates.remote(path, column, str(query), cand_k, terms, want)
+        for i, path in enumerate(shard_paths)
+    ]
+    cands = [t for t in shim.get(cand_refs) if t is not None and t.num_rows > 0]
+    if not cands:
+        return pa.table({})
+    merged = pa.concat_tables(cands, promote_options="default").combine_chunks()
+    doc_lens = merged.column("_doc_len").to_pylist()
+    tf_arrays = [merged.column(f"_tf_{i}").to_pylist() for i in range(len(terms))]
+    scores = []
+    for row in range(merged.num_rows):
+        tf = {terms[i]: tf_arrays[i][row] for i in range(len(terms))}
+        scores.append(_bm25.bm25_score(tf, doc_lens[row], idfs, avgdl))
+    import numpy as np
 
-    merged = pa.concat_tables(locals_).combine_chunks()
-    con = jude.connect()
-    con.register("_m", merged)
-    order = "_score DESC" if "_score" in merged.column_names else "1"
-    return con.sql(f"SELECT * FROM _m ORDER BY {order} LIMIT {int(k)}").to_arrow()
+    order = np.argsort(scores, kind="stable")[::-1][: int(k)]
+    drop = ["_doc_len", "_score", *[f"_tf_{i}" for i in range(len(terms))]]
+    keep_cols = [c for c in merged.column_names if c not in drop]
+    out = merged.select(keep_cols).take(pa.array(order.tolist(), type=pa.int64()))
+    return out.append_column("_score", pa.array([scores[i] for i in order], type=pa.float64()))
 
 
 def distributed_hybrid(

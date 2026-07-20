@@ -230,6 +230,56 @@ class _JudeWorker:
                           limit=int(k), columns=want)
         return _realign(out) if out.num_rows else out
 
+    def fts_termstats(self, path: str, column: str, terms: list) -> tuple:
+        """Pass 1 of distributed global-IDF BM25: scan this shard's text column and
+        return (n_docs, total_tokens, {term: doc_frequency}) for the query terms.
+        The driver sums these into corpus-wide N / avgdl / df so BM25 uses global
+        statistics instead of shard-local ones."""
+        from jude import _bm25, _lance
+
+        tbl = _lance.dataset_cached(path).to_table(columns=[column])
+        texts = tbl.column(column).to_pylist()
+        tset = set(terms)
+        df: dict = {t: 0 for t in terms}
+        total = 0
+        for txt in texts:
+            toks = _bm25.tokenize(txt or "")
+            total += len(toks)
+            for w in set(toks):
+                if w in tset:
+                    df[w] += 1
+        return len(texts), total, df
+
+    def fts_candidates(self, path: str, column: str, query: str, k: int, terms: list,
+                       columns) -> "pa.Table":
+        """Pass 2 of distributed global-IDF BM25: return this shard's local top-k
+        candidates (by Lance's own BM25) WITH each candidate's document length and
+        per-query-term frequencies, so the driver can rescore them with GLOBAL
+        IDF/avgdl and merge to the exact global top-k."""
+        import pyarrow as pa
+        from jude import _bm25, _lance
+
+        ds = _lance.dataset_cached(path)
+        want = None  # columns=None -> fetch ALL columns (so id/payload survive)
+        if columns is not None:
+            want = list(dict.fromkeys(list(columns) + [column]))
+        out = ds.to_table(full_text_query={"query": query, "columns": [column]},
+                          limit=int(k), columns=want)
+        if out.num_rows == 0:
+            out = _realign(out)
+        texts = out.column(column).to_pylist()
+        doc_lens = []
+        tf_cols: dict = {f"_tf_{i}": [] for i in range(len(terms))}
+        for txt in texts:
+            dl, tf = _bm25.doc_termstats(txt or "", terms)
+            doc_lens.append(dl)
+            for i, t in enumerate(terms):
+                tf_cols[f"_tf_{i}"].append(tf[t])
+        res = out.append_column("_doc_len", pa.array(doc_lens, type=pa.int64()))
+        for name, vals in tf_cols.items():
+            res = res.append_column(name, pa.array(vals, type=pa.int64()))
+        return _realign(res)
+
     def _resident_shard(self, path: str, column: str, id_column: str = "id"):
         """(ids, mat, norms) for a resident Lance shard, cached on this actor and
         refreshed when the dataset's on-disk version advances. Opening the dataset
