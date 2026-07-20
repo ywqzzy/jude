@@ -123,6 +123,7 @@ __all__ = [
     "token_length_filter",
     "add_provenance",
     "blend_by_tokens",
+    "sample_dropped",
     # cosmos stages
     "ChunkStage",
     "QualityFilterStage",
@@ -914,6 +915,46 @@ def blend_by_tokens(
     merged = pa.concat_tables(parts, promote_options="default").combine_chunks()
     perm = rng.permutation(merged.num_rows)
     return merged.take(pa.array(perm.tolist(), type=pa.int64()))
+
+
+# --- X.3. interactive inspection: what did a filter drop? --------------------
+
+
+def sample_dropped(
+    before: pa.Table,
+    after: pa.Table,
+    *,
+    column: str = "text",
+    n: int = 20,
+    seed: int = 0,
+) -> pa.Table:
+    """Return a sample of rows that a curation step DROPPED — the rows present in
+    ``before`` but not in ``after`` (matched by normalized content of ``column``).
+    The tune-your-thresholds loop: run a filter, eyeball what it removed, adjust.
+    Multiplicity-aware (if ``before`` had 3 copies and ``after`` has 1, 2 are
+    dropped)."""
+    import numpy as np
+
+    def _key(t: pa.Table) -> list:
+        return [_curate.normalize_text(x) if x else "" for x in _col(t, column)]
+
+    from collections import Counter
+
+    after_counts = Counter(_key(after))
+    before_keys = _key(before)
+    dropped_idx: list[int] = []
+    remaining = dict(after_counts)
+    for i, k in enumerate(before_keys):
+        if remaining.get(k, 0) > 0:
+            remaining[k] -= 1          # this before-row survived
+        else:
+            dropped_idx.append(i)      # no survivor left for this key -> dropped
+    if not dropped_idx:
+        return before.slice(0, 0)
+    rng = np.random.default_rng(seed)
+    if len(dropped_idx) > n:
+        dropped_idx = sorted(rng.choice(dropped_idx, size=n, replace=False).tolist())
+    return before.take(pa.array(dropped_idx, type=pa.int64()))
 
 
 # --- cosmos pipeline stages --------------------------------------------------

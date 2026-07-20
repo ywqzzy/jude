@@ -163,3 +163,36 @@ def write_token_shards(
             json.dump(meta, f)
         return meta
     raise ValueError(f"unknown fmt {fmt!r}; use 'lance' or 'bin'")
+
+
+def write_shuffled_shards(
+    table: pa.Table,
+    path: str,
+    *,
+    column: str = "input_ids",
+    n_shards: int = 8,
+    fmt: str = "bin",
+    dtype: str = "int32",
+    seed: int = 0,
+) -> list[dict]:
+    """Globally shuffle packed sequences and write them across ``n_shards`` shards
+    (L4.4) — the training-loader layout: a random order so consecutive training
+    steps see decorrelated sequences, split into shard files for parallel loading.
+    Deterministic given ``seed``. Writes ``path.00000``, ``path.00001``, … (each a
+    Lance dataset or a .bin/.idx.json pair)."""
+    import numpy as np
+
+    n = table.num_rows
+    perm = np.random.default_rng(seed).permutation(n)
+    shuffled = table.take(pa.array(perm.tolist(), type=pa.int64()))
+    ns = max(1, int(n_shards))
+    per = (n + ns - 1) // ns
+    out: list[dict] = []
+    for s in range(ns):
+        lo = s * per
+        if lo >= n:
+            break
+        part = shuffled.slice(lo, min(per, n - lo))
+        shard_path = f"{path}.{s:05d}"
+        out.append(write_token_shards(part, shard_path, column=column, fmt=fmt, dtype=dtype))
+    return out
