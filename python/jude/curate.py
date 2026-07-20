@@ -115,6 +115,8 @@ __all__ = [
     "redact_pii",
     "detect_pii",
     "decontaminate",
+    "c4_line_filter",
+    "corpus_line_dedup",
     # cosmos stages
     "ChunkStage",
     "QualityFilterStage",
@@ -567,6 +569,107 @@ def decontaminate(
         return table.append_column(reason_column, pa.array(ratios, type=pa.float64()))
     keep = [i for i, r in enumerate(ratios) if r <= threshold]
     return table.take(pa.array(keep, type=pa.int64()))
+
+
+# --- C1. web-corpus curation: line-level cleaning + cross-doc dedup ----------
+
+# boilerplate markers that flag a line as web chrome / non-prose (C4-style).
+_C4_LINE_MARKERS = (
+    "javascript", "lorem ipsum", "terms of service", "terms of use", "privacy policy",
+    "all rights reserved", "cookie", "read more", "click here", "sign up", "log in",
+    "{", "}", "©",
+)
+
+
+def c4_line_filter(
+    table: pa.Table,
+    *,
+    column: str = "text",
+    out_column: str | None = None,
+    min_words: int = 3,
+    require_terminal_punct: bool = True,
+    drop_markers: tuple[str, ...] = _C4_LINE_MARKERS,
+) -> pa.Table:
+    """C4-style LINE cleaning (C1): within each document drop web-chrome lines and
+    keep prose. A line is dropped if it has fewer than ``min_words`` words, does
+    not end in terminal punctuation (``. ! ? "`` — off with
+    ``require_terminal_punct=False``), or contains a boilerplate marker
+    (javascript / cookie / nav text / curly braces). The surviving lines are
+    rejoined. Writes back to ``column`` (or ``out_column``). Rows left empty after
+    cleaning are kept as ""; filter them separately if desired."""
+    dst = out_column or column
+    terminal = (".", "!", "?", '"', "。", "！", "？")
+    out_texts: list = []
+    for txt in _col(table, column):
+        if not txt:
+            out_texts.append(txt)
+            continue
+        kept = []
+        for line in txt.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if len(s.split()) < min_words:
+                continue
+            if require_terminal_punct and not s.endswith(terminal):
+                continue
+            if any(m in low for m in drop_markers):
+                continue
+            kept.append(s)
+        out_texts.append("\n".join(kept))
+    arr = pa.array(out_texts, type=pa.string())
+    if dst in table.column_names:
+        return table.set_column(table.column_names.index(dst), dst, arr)
+    return table.append_column(dst, arr)
+
+
+def corpus_line_dedup(
+    table: pa.Table,
+    *,
+    column: str = "text",
+    out_column: str | None = None,
+    min_docs: int = 2,
+    normalize: bool = True,
+) -> pa.Table:
+    """Cross-document LINE dedup (C1): remove lines that appear in ``min_docs`` or
+    more distinct documents — the repeated headers/footers/nav that web crawls
+    duplicate across pages. A two-pass corpus operator: count each line's
+    document frequency, then drop lines at/above the threshold from every doc.
+    ``normalize`` lowercases + strips for the frequency key (display text keeps
+    its original form). Writes to ``column`` (or ``out_column``)."""
+    dst = out_column or column
+    texts = _col(table, column)
+
+    def key(line: str) -> str:
+        s = line.strip()
+        return s.lower() if normalize else s
+
+    # pass 1: document frequency per line key
+    doc_freq: dict[str, int] = {}
+    for txt in texts:
+        if not txt:
+            continue
+        seen: set[str] = set()
+        for line in txt.splitlines():
+            k = key(line)
+            if k and k not in seen:
+                seen.add(k)
+                doc_freq[k] = doc_freq.get(k, 0) + 1
+
+    # pass 2: drop lines whose document frequency >= min_docs
+    out_texts: list = []
+    for txt in texts:
+        if not txt:
+            out_texts.append(txt)
+            continue
+        kept = [ln for ln in txt.splitlines()
+                if not (key(ln) and doc_freq.get(key(ln), 0) >= min_docs)]
+        out_texts.append("\n".join(kept))
+    arr = pa.array(out_texts, type=pa.string())
+    if dst in table.column_names:
+        return table.set_column(table.column_names.index(dst), dst, arr)
+    return table.append_column(dst, arr)
 
 
 # --- cosmos pipeline stages --------------------------------------------------

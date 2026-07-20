@@ -23,7 +23,7 @@
 
 ## 🟡 C. LLM 数据引擎能力缺口(最贴定位,深耕方向)
 
-- ⬜ **C1 缺 web 管线前半**:无 HTML/boilerplate 抽取、无行级 dedup、无精确子串/后缀数组 dedup、无 WARC 读(`llm_data_engine_plan.zh.md:52,118`)。
+- 🔧 **C1 web 管线前半** → 部分修:新增 `c4_line_filter`(C4 式**行级清洗**:丢字数不足/无终止标点/含 boilerplate 标记 javascript/cookie/nav/花括号的行,保留正文行)+ `corpus_line_dedup`(**跨文档行去重**:统计每行的文档频率,丢在 ≥min_docs 个文档里重复出现的 header/footer/nav 样板行,可 normalize 大小写)。两者纯 Python,语料级两遍。测试 `test_web_curation.py`(7)。仍待办:精确子串/后缀数组去重(Lee et al.)、HTML/WARC 抽取。
 - 🔧 **C2 quality 欠 Gopher/C4** → 部分修:新增 **stopword 门**(`stopword_ratio` + `min_stopword_ratio`=0.06:够长的文档若停用词太少→关键词垃圾,拒)、**重复 n-gram**(`dup_ngram_ratio` = 重复 word-3gram 占比 + `max_dup_ngram_ratio`=0.30)、**激活死信号 digit_ratio**(`max_digit_ratio`=0.30)。三者接进 `quality_reject_reason` + Python 阈值 kwargs + `quality_signals` 列。测试 `test_quality_gopher.py`(6)+ Rust 3 个单测。仍待办:C4 行级过滤(去无标点行/JS/cookie 提示)、blocklist、perplexity/fastText 质量分。
 - 🔧 **C3 LSH bands 不按 threshold 校准** → 已修:新增 `optimal_lsh_bands(threshold, num_hashes)`(datasketch 式最小化假阳+假阴面积,得 S 曲线 crossover≈threshold);`fuzzy_dedup`/`dist_fuzzy_dedup` 的 `bands` 默认 `None` → 按 threshold 自动校准(旧固定 16 只在 ~0.7 附近才准,别的阈值静默丢召回)。显式传 `bands` 仍可覆盖。测试 `test_lsh_calibration.py`(3:crossover 单调贴合、低阈值召回 ≥ 固定 16、显式覆盖)。默认 `ngram=2` 仍偏小(判断项,暂留以免动既有行为)。
 - 🟡 **C4 语言识别** 6 语启发式,置信度已修:改为**边际式**(winner_hits/total_hits)—— 明显英文不再得 ~0.08(旧的绝对停用词覆盖),`language_filter(min_confidence=.5)` 不再误删英文;日文带假名正确识别为 ja。纯 kanji 仍可能误判 zh(启发式边界,无 fastText lid.176)。
