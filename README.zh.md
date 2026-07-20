@@ -79,8 +79,8 @@ result = runner.collect(relation)          # 分区、并行、归并
 ```
 
 - **流式 stage-DAG 执行器** —— 在 shuffle 边界(Aggregate / Join / Distinct / Order / SetOp)把计划切成流水线阶段;map 与 reduce 重叠。
-- **分布式 join 与聚合** —— hash-shuffle exchange 通过 Ray object store 流转 Arrow(`distributed_join`、流式变体、两阶段聚合);确定性 FNV-1a 路由;倾斜感知子分区。
-- **健壮性** —— 查询级 SQL 重试、actor 预热、推测执行。
+- **分布式 join 与聚合** —— hash-shuffle exchange 通过 Ray object store 流转 Arrow(`distributed_join`、流式变体、两阶段聚合);确定性 FNV-1a shuffle 路由。
+- **健壮性** —— 查询级重试:worker 故障时整条分布式读**重跑**(`RAY_MAX_QUERY_RETRIES`),而非 actor 级恢复。
 - **资源感知调度** —— GPU / 内存 / object-store 准入控制 + 跨并发查询的 worst-fit 装箱,都在 Rust。
 - **分布式数据源** —— 生成器驱动的流式扫描、分布式 Hive 读、分布式 Lance 写 + 分布式向量索引构建。
 

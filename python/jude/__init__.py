@@ -47,6 +47,7 @@ from . import training_format  # noqa: F401
 from . import vector  # noqa: F401
 from .vector_search import VectorSearch  # noqa: F401
 from . import lance  # noqa: F401
+from . import retrieval  # noqa: F401
 from . import structured  # noqa: F401
 from . import types  # noqa: F401
 from . import sqltypes  # noqa: F401

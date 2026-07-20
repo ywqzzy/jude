@@ -96,8 +96,9 @@ result = runner.collect(relation)          # partitioned, parallel, merged
   reduce overlap.
 - **Distributed joins & aggregations** — hash-shuffle exchange flows Arrow
   through the Ray object store (`distributed_join`, streaming variant, two-phase
-  aggregate); deterministic FNV-1a routing; skew-aware sub-partitioning.
-- **Robustness** — query-level SQL retry, actor warm-up, speculative execution.
+  aggregate); deterministic FNV-1a shuffle routing.
+- **Robustness** — query-level retry: on a worker fault the whole distributed
+  read re-executes (`RAY_MAX_QUERY_RETRIES`), rather than actor-level recovery.
 - **Resource-aware scheduling** — GPU / memory / object-store admission control
   and worst-fit bin-packing across concurrent queries, in Rust.
 - **Distributed data sources** — generator-backed streaming scans, distributed

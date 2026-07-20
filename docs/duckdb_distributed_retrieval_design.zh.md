@@ -77,7 +77,7 @@ query ──┤   ...（每分片一个,Rust 调度路由;向量可簇路由,只
 
 ## 6. 分期
 
-- **P0(今天可用,零新代码)**:形态 B —— `vector.*`/`distributed_*` 出候选 → `register` → `con.sql` join/聚合。先在文档给出配方,验证价值。
+- **P0(✅ 已实现,`jude.retrieval`)**:形态 B —— `retrieval.search_then_sql(con, sql, candidates=...)` 把检索结果(`vector.*` / `distributed_*` / FTS)注册为命名关系,再跑引用它的 SQL;`retrieval.hybrid_analytical(con, path, sql, vector_query=/text_query=, ...)` 是常见 RAG-分析场景的便捷封装(单机走 `knn_rerank` 带 payload 列,分布式走分片检索)。检索与 join/聚合/过滤在一个 DuckDB 计划里融合。
 - **P1**:`lance_scan(path)` table function + 投影/谓词下推(把 `read_lance` 从"全量物化"升级为"流式 + 下推")。
 - **P2**:`jude_search`/`jude_fts` table function(一条 SQL 完成两段式)。
 - **P3**:分布式混合查询把阶段 2 接入 stage-DAG(候选表作为 shuffle 输入),支持大维表分布式 join/聚合。
