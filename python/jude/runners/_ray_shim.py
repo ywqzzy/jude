@@ -543,6 +543,37 @@ class _JudeWorker:
         lst = ", ".join("'" + f.replace("'", "''") + "'" for f in files)
         return self._conn.sql(f"SELECT * FROM read_parquet([{lst}], {opts})").to_arrow()
 
+    def read_scan(self, kind: str, spec: Any, opts: dict) -> "pa.Table":
+        """Worker side of a distributed scan: read this worker's SHARD of a source
+        directly (never through the driver). `spec` is a file list for
+        parquet/csv/json, or (path, fragment_ids, columns, filter) for lance.
+        Returns realigned Arrow so the driver can concat/register it."""
+        columns = opts.get("columns")
+        where = opts.get("where")
+        if kind == "lance":
+            import lance
+
+            path, frag_ids = spec
+            ds = lance.dataset(path)
+            want = set(frag_ids)
+            frags = [f for f in ds.get_fragments() if f.fragment_id in want]
+            tbl = ds.scanner(fragments=frags, columns=columns, filter=where).to_table()
+            return _realign(tbl) if tbl.num_rows else tbl
+        lst = ", ".join("'" + f.replace("'", "''") + "'" for f in spec)
+        proj = ", ".join(columns) if columns else "*"
+        filt = f" WHERE {where}" if where else ""
+        if kind == "parquet":
+            src = f"read_parquet([{lst}])"
+        elif kind == "csv":
+            extra = "".join(f", {k}={v!r}" for k, v in (opts.get("csv") or {}).items())
+            src = f"read_csv_auto([{lst}]{extra})"
+        elif kind == "json":
+            src = f"read_json_auto([{lst}])"
+        else:
+            raise ValueError(f"read_scan: unknown kind {kind!r}")
+        out = self._conn.sql(f"SELECT {proj} FROM {src}{filt}").to_arrow()
+        return _realign(out) if out.num_rows else out
+
     def distinct_bucket(self, shard_refs: list) -> "pa.Table":
         """Reducer side of a distributed DISTINCT: gather a bucket's shards
         (co-located duplicates) and emit distinct rows."""

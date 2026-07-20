@@ -364,6 +364,67 @@ class RayRunner(Runner):
             return shim.get([workers[0].read_hive_files.remote(groups[0], hive_partitioning, union_by_name)])[0]
         return pa.concat_tables(parts).combine_chunks()
 
+    def distributed_scan(self, kind: str, path: str, *, columns: Any = None,
+                         where: str | None = None, csv: dict | None = None) -> "pa.Table":
+        """Distributed, worker-side sharded read of a scan source — each worker
+        reads its OWN shard directly (parquet/csv/json split by file across a glob;
+        lance split by fragment), with column projection + predicate pushed down,
+        then the driver concats. Data never funnels through the driver (fixes B1
+        for the scan path). A SINGLE file/fragment isn't worth distributing, so it
+        reads single-node.
+
+        ``kind``: "parquet" | "csv" | "json" | "lance". ``path`` is a glob (file
+        sources) or dataset path (lance). Worker assignment is decided by the Rust
+        WorkerManager (``worker_for``).
+        """
+        import glob as _glob
+
+        import pyarrow as pa
+
+        opts = {"columns": columns, "where": where, "csv": csv or {}}
+
+        # resolve split units per source type
+        if kind == "lance":
+            import lance
+
+            units = [f.fragment_id for f in lance.dataset(path).get_fragments()]
+            spec_of = lambda grp: (path, grp)  # noqa: E731
+        else:
+            units = sorted(_glob.glob(path, recursive=True))
+            if not units:
+                raise FileNotFoundError(f"no files match {path!r}")
+            spec_of = lambda grp: grp  # noqa: E731
+
+        # single unit -> not worth distributing; read single-node
+        if len(units) <= 1:
+            import jude
+
+            con = jude.connect()
+            proj = ", ".join(columns) if columns else "*"
+            filt = f" WHERE {where}" if where else ""
+            if kind == "lance":
+                tbl = jude._lance.read_table(path, columns=columns, filter=where)
+                return tbl
+            lst = ", ".join("'" + f.replace("'", "''") + "'" for f in units)
+            reader = {"parquet": f"read_parquet([{lst}])",
+                      "csv": f"read_csv_auto([{lst}])",
+                      "json": f"read_json_auto([{lst}])"}[kind]
+            return con.sql(f"SELECT {proj} FROM {reader}{filt}").to_arrow()
+
+        # shard units across workers (routing decided by the Rust WorkerManager)
+        workers = self._ensure_workers()
+        n = min(len(units), max(1, self.num_workers))
+        step = (len(units) + n - 1) // n
+        groups = [units[i : i + step] for i in range(0, len(units), step)]
+        submit = [
+            (lambda i=i, grp=grp: workers[self.mgr.worker_for(i)].read_scan.remote(kind, spec_of(grp), opts))
+            for i, grp in enumerate(groups)
+        ]
+        parts = [t for t in self._dispatch_bounded(submit) if t is not None and t.num_rows > 0]
+        if not parts:
+            return shim.get([workers[0].read_scan.remote(kind, spec_of(groups[0]), opts)])[0]
+        return pa.concat_tables(parts).combine_chunks()
+
     def streaming_transform(self, relation: Any, sql_template: str = "SELECT * FROM part", batch_size: int | None = None) -> "Iterator[pa.Table]":
         """Sub-batch streaming for row-wise ops (filter / project / scalar map):
         each partition's worker processes ONE input batch at a time and yields
