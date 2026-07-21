@@ -96,7 +96,10 @@ def read_arrow(url: str, *, fmt: str = "parquet", columns: Any = None,
             import pyarrow.csv as pacsv
             import pyarrow.json as pajson
 
-            with pafs.open_input_file(p) as f:
+            # fsspec transparently decompresses .gz/.bz2/.zst by extension so
+            # compressed shards (.jsonl.gz, .csv.gz — common in crawl dumps) read
+            # directly.
+            with fs.open(p, "rb", compression="infer") as f:
                 t = pacsv.read_csv(f) if fmt == "csv" else pajson.read_json(f)
             tables.append(t.select(columns) if columns else t)
         else:
