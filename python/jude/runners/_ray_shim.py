@@ -104,6 +104,20 @@ class _JudeWorker:
 
         self._jude = jude
         self._conn = jude.connect()
+        # X.2 spill: let DuckDB spill hash-agg / join / sort to disk on the worker
+        # instead of OOMing when a reducer's bucket is large. We don't build a
+        # spill engine — DuckDB has one; we just point it at a temp dir and (if
+        # requested) cap memory. Configurable via env; off by default (unset
+        # memory_limit = DuckDB's 80%-of-RAM default) so small jobs are unaffected.
+        try:
+            tmp = os.environ.get("JUDE_SPILL_DIR")
+            if tmp:
+                self._conn.sql(f"SET temp_directory='{tmp}'")
+            mem = os.environ.get("JUDE_WORKER_MEMORY_LIMIT")
+            if mem:
+                self._conn.sql(f"SET memory_limit='{mem}'")
+        except Exception:  # noqa: BLE001 — spill config must never break a worker
+            pass
         self._vec_cache: dict = {}  # path -> (version, ids, matrix, norms); version-stamped
 
     def run_sql_on_table(self, table: "pa.Table", sql_template: str) -> "pa.Table":
