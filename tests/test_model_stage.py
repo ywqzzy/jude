@@ -69,3 +69,28 @@ def test_model_scorer_stage_callable_with_lazy_setup():
     assert out.column("q").to_pylist() == [2.0, 3.0]
     scorer(t)                                        # second call reuses the model
     assert len(loads) == 1                           # setup ran once, not per batch
+
+
+def test_fasttext_scorer_clear_error_without_dep():
+    # fasttext isn't installed -> a clear, actionable ImportError (not a crash)
+    import pytest
+    from jude import model_stage as ms
+    try:
+        import fasttext  # noqa: F401
+        pytest.skip("fasttext is installed")
+    except ImportError:
+        pass
+    with pytest.raises(ImportError, match="fasttext"):
+        ms.fasttext_scorer("lid.176.bin")
+
+
+def test_kenlm_scorer_clear_error_without_dep():
+    import pytest
+    from jude import model_stage as ms
+    try:
+        import kenlm  # noqa: F401
+        pytest.skip("kenlm is installed")
+    except ImportError:
+        pass
+    with pytest.raises(ImportError, match="kenlm"):
+        ms.kenlm_perplexity_scorer("model.arpa")

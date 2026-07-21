@@ -113,3 +113,51 @@ class ModelScorer:
     def __call__(self, table: "pa.Table") -> "pa.Table":
         return model_score(table, self._fn(), column=self.column,
                            out_column=self.out_column, batch_size=self.batch_size)
+
+
+# --- concrete model backends (optional deps; the model is user-supplied) -----
+
+
+def fasttext_scorer(model_path: str, *, label: str | None = None) -> Scorer:
+    """A batch Scorer backed by a fastText model (CPU) — e.g. lid.176.bin for
+    language ID (L1.3) or a FineWeb-edu-style quality classifier. Returns the
+    probability of ``label`` (the top label's prob if ``label`` is None). Pair
+    with ``model_filter`` for a model-based quality/language gate. Needs the
+    ``fasttext`` package (lazy-imported)."""
+    try:
+        import fasttext
+    except ImportError as e:  # pragma: no cover - exercised via the missing-dep test
+        raise ImportError("fasttext_scorer needs `fasttext` (pip install fasttext-wheel)") from e
+
+    model = fasttext.load_model(model_path)
+
+    def score(batch: list[str]) -> list[float]:
+        out: list[float] = []
+        for text in batch:
+            labels, probs = model.predict((text or "").replace("\n", " "), k=-1)
+            if label is None:
+                out.append(float(probs[0]) if len(probs) else 0.0)
+            else:
+                want = f"__label__{label}"
+                out.append(float(next((p for l, p in zip(labels, probs) if l == want), 0.0)))
+        return out
+
+    return score
+
+
+def kenlm_perplexity_scorer(model_path: str) -> Scorer:
+    """A batch Scorer returning each doc's **perplexity** under a KenLM n-gram
+    model (L3.3) — lower = more fluent/in-domain. Use with ``model_filter(...,
+    keep="<=", threshold=...)`` to drop high-perplexity junk. Needs the ``kenlm``
+    package (lazy-imported)."""
+    try:
+        import kenlm
+    except ImportError as e:  # pragma: no cover
+        raise ImportError("kenlm_perplexity_scorer needs `kenlm` (pip install kenlm)") from e
+
+    model = kenlm.Model(model_path)
+
+    def score(batch: list[str]) -> list[float]:
+        return [float(model.perplexity(t or "")) for t in batch]
+
+    return score
