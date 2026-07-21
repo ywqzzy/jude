@@ -34,6 +34,7 @@ __all__ = [
     "dist_exact_dedup",
     "dist_fuzzy_dedup",
     "dist_substring_dedup",
+    "dist_image_dedup",
     "dist_global_shuffle",
     "dist_blend_datasets",
 ]
@@ -187,7 +188,6 @@ def dist_fuzzy_dedup(
     """
     from jude.runners import _ray_shim as shim
     import jude
-    from jude.jude import _curate
     from jude.curate import optimal_lsh_bands
 
     if bands is None:
@@ -262,6 +262,9 @@ def dist_fuzzy_dedup(
     return table.take(pa.array(keep, type=pa.int64())).combine_chunks()
 
 
+# --- L2.2 distributed exact-substring dedup ---------------------------------
+
+
 def dist_substring_dedup(
     table: pa.Table, *, column: str = "text", out_column: str | None = None,
     k: int = 50, runner: Any = None,
@@ -334,6 +337,63 @@ def dist_substring_dedup(
     if dst in table.column_names:
         return table.set_column(table.column_names.index(dst), dst, arr).combine_chunks()
     return table.append_column(dst, arr).combine_chunks()
+
+
+def dist_image_dedup(
+    table: pa.Table, *, column: str = "image", kind: str = "phash",
+    max_distance: int = 6, bands: int = 4, keep_cluster: bool = False,
+    runner: Any = None,
+) -> pa.Table:
+    """Distributed near-duplicate IMAGE dedup (multimodal), recall-matched to
+    single-node ``curate_mm.image_dedup``. Each shard perceptual-hashes its
+    images and routes (rid, band_key, hash) to buckets by EACH LSH band of the
+    hex hash; each reducer verifies candidate pairs by Hamming distance <=
+    max_distance and emits near-dup edges; the driver runs a global union-find
+    (union-by-min → lowest row index kept), matching the single-node result at
+    scale. Only (rid, band_key, hash) is shuffled, never the pixels."""
+    from jude.runners import _ray_shim as shim
+    import jude
+
+    r = _runner(runner)
+    con = jude.connect()
+    parts = r._partition_tables(con.from_arrow(table))
+    workers = r._ensure_workers()
+    b = r.mgr.shuffle_bucket_count(None)
+    bucket_workers = r.mgr.shuffle_bucket_workers(None)
+    offsets: list[int] = []
+    acc = 0
+    for part in parts:
+        offsets.append(acc)
+        acc += part.num_rows
+    refs = [
+        workers[r.mgr.worker_for(i)].curate_image_hash_edges.options(num_returns=b).remote(
+            part, column, kind, bands, b, offsets[i]
+        )
+        for i, part in enumerate(parts)
+    ]
+    refs = [x if isinstance(x, list) else [x] for x in refs]
+    edge_refs = [
+        workers[bucket_workers[bkt]].curate_image_dups_bucket.remote(
+            [refs[p][bkt] for p in range(len(parts))], max_distance
+        )
+        for bkt in range(b)
+    ]
+    n = table.num_rows
+    uf = _UnionFind(n)
+    for ref in edge_refs:
+        et = shim.get([ref])[0]
+        if et is None or et.num_rows == 0:
+            continue
+        for a, bb in zip(et.column("a").to_pylist(), et.column("b").to_pylist()):
+            uf.union(a, bb)
+        del et
+    reps = [uf.find(i) for i in range(n)]
+    if keep_cluster:
+        return table.append_column("img_cluster", pa.array(reps, type=pa.int64())).combine_chunks()
+    keep = [i for i in range(n) if reps[i] == i]
+    if len(keep) == n:
+        return table
+    return table.take(pa.array(keep, type=pa.int64())).combine_chunks()
 
 
 # --- C9. distributed global shuffle + blend ---------------------------------

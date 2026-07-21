@@ -532,6 +532,70 @@ class _JudeWorker:
         return pa.table({"_doc": pa.array(out_doc, type=pa.int64()),
                          "_pos": pa.array(out_pos, type=pa.int64())})
 
+    def curate_image_hash_edges(self, table: "pa.Table", column: str, kind: str,
+                                bands: int, num_buckets: int, row_offset: int) -> list:
+        """Producer for distributed image dedup: perceptual-hash each image, then
+        route (rid, band_key, hash) to buckets by EACH LSH band of the hex hash —
+        images sharing any band co-locate (matches single-node image_dedup)."""
+        import pyarrow as pa
+        from jude.curate_mm import _hash_column
+
+        t = _realign(table)
+        hashes = _hash_column(t, column, kind)
+        rid_b: list[list[int]] = [[] for _ in range(num_buckets)]
+        key_b: list[list[str]] = [[] for _ in range(num_buckets)]
+        h_b: list[list[str]] = [[] for _ in range(num_buckets)]
+        for i, h in enumerate(hashes):
+            if not h:
+                continue
+            rid = row_offset + i
+            wlen = max(1, len(h) // max(1, bands))
+            for b in range(bands):
+                key = f"{b}:{h[b * wlen:(b + 1) * wlen]}"
+                bkt = _det_hash(key) % num_buckets
+                rid_b[bkt].append(rid)
+                key_b[bkt].append(key)
+                h_b[bkt].append(h)
+        out = []
+        for bkt in range(num_buckets):
+            out.append(pa.table({"_rid": pa.array(rid_b[bkt], type=pa.int64()),
+                                 "_key": pa.array(key_b[bkt], type=pa.string()),
+                                 "_hash": pa.array(h_b[bkt], type=pa.string())}))
+        return out if num_buckets > 1 else out[0]
+
+    def curate_image_dups_bucket(self, shard_refs: list, max_distance: int) -> "pa.Table":
+        """Reducer for distributed image dedup: within each band-key group, verify
+        candidate pairs by perceptual-hash Hamming distance <= max_distance and
+        emit near-dup EDGES (rid pairs) for the driver's global union-find."""
+        import pyarrow as pa
+        from jude.jude import _curate
+
+        shards = [t for t in ray.get(shard_refs) if t is not None and t.num_rows > 0]
+        empty = pa.table({"a": pa.array([], type=pa.int64()), "b": pa.array([], type=pa.int64())})
+        if not shards:
+            return empty
+        merged = _realign(pa.concat_tables(shards))
+        rids = merged.column("_rid").to_pylist()
+        keys = merged.column("_key").to_pylist()
+        hh = merged.column("_hash").to_pylist()
+        by_key: dict[str, list[int]] = {}
+        for i, k in enumerate(keys):
+            by_key.setdefault(k, []).append(i)
+        edges: set = set()
+        for members in by_key.values():
+            if len(members) < 2:
+                continue
+            for x in range(len(members)):
+                for y in range(x + 1, len(members)):
+                    ix, iy = members[x], members[y]
+                    if _curate.image_hash_distance(hh[ix], hh[iy]) <= max_distance:
+                        a, b = rids[ix], rids[iy]
+                        edges.add((min(a, b), max(a, b)))
+        if not edges:
+            return empty
+        return pa.table({"a": pa.array([e[0] for e in edges], type=pa.int64()),
+                         "b": pa.array([e[1] for e in edges], type=pa.int64())})
+
     def curate_fuzzy_edges_bucket(self, shard_refs: list, threshold: float) -> "pa.Table":
         """Reducer side of distributed fuzzy dedup: gather a bucket's
         (_rid, _bandkey, _sig) rows, group by exact band key (LSH candidates),
