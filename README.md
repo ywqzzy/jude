@@ -185,6 +185,10 @@ distributed form.
 ### 💾 Storage & versioning
 Lance (read + single-machine & distributed write, git-like **branches/tags** for
 data versioning, vector + FTS indexes), plus Hive and Iceberg read.
+**Object-store IO** (`jude.storage`): read/write parquet/csv/json (incl. `.gz`)
+over any fsspec URL — `s3://` / `gs://` / local / `memory://` — so sources and
+sinks point at S3/GCS/MinIO (creds via `storage_options`). **WARC/WET ingest**
+(`jude.warc`): stream CommonCrawl archives into Arrow.
 
 ### 📊 Observability
 A GIL-free Rust metrics registry (per query / stage / UDF / cluster), a durable
