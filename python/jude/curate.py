@@ -693,6 +693,26 @@ def _token_hashes(tokens: list[str]) -> list[int]:
                            "little") % _MOD_61 for t in tokens]
 
 
+def window_hashes(tokens: list[str], k: int) -> list[int]:
+    """64-bit polynomial rolling hash of every ``k``-token window (one per window
+    start; empty if fewer than ``k`` tokens). Shared by the single-node and
+    distributed exact-substring dedup so their window identities match exactly."""
+    n = len(tokens)
+    if n < k:
+        return []
+    th = _token_hashes(tokens)
+    bk = pow(_POLY_B, k - 1, _MOD_61)
+    out: list[int] = []
+    h = 0
+    for j in range(k):
+        h = (h * _POLY_B + th[j]) % _MOD_61
+    for i in range(0, n - k + 1):
+        if i > 0:
+            h = ((h - th[i - 1] * bk) * _POLY_B + th[i + k - 1]) % _MOD_61
+        out.append(h)
+    return out
+
+
 def substring_dedup(
     table: pa.Table,
     *,
@@ -711,10 +731,10 @@ def substring_dedup(
     repeated window is dropped and the survivors are rejoined (whitespace-
     tokenized). Documents shorter than ``k`` tokens pass through unchanged.
     Sequential over the corpus (first occurrence wins), so it's deterministic.
+    See ``jude.curate_dist.dist_substring_dedup`` for the distributed form.
     """
     dst = out_column or column
     seen: set[int] = set()
-    bk = pow(_POLY_B, k - 1, _MOD_61)  # B^(k-1) mod M, for rolling the window
     out_texts: list = []
     for txt in _col(table, column):
         if not txt:
@@ -725,16 +745,8 @@ def substring_dedup(
         if n < k:
             out_texts.append(txt)
             continue
-        th = _token_hashes(toks)
         dup = [False] * n
-        # initial window hash over tokens [0, k)
-        h = 0
-        for j in range(k):
-            h = (h * _POLY_B + th[j]) % _MOD_61
-        for i in range(0, n - k + 1):
-            if i > 0:
-                # roll: drop token i-1, add token i+k-1
-                h = ((h - th[i - 1] * bk) * _POLY_B + th[i + k - 1]) % _MOD_61
+        for i, h in enumerate(window_hashes(toks, k)):
             if h in seen:
                 for j in range(i, i + k):
                     dup[j] = True

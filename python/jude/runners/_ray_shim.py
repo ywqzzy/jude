@@ -468,6 +468,70 @@ class _JudeWorker:
             }))
         return out if num_buckets > 1 else out[0]
 
+    def curate_substring_windows(self, table: "pa.Table", column: str, k: int,
+                                 num_buckets: int, row_offset: int) -> list:
+        """Producer for distributed exact-substring dedup: for each doc, emit its
+        k-token window hashes as (h, doc, pos) rows, routed to `num_buckets` by
+        h % num_buckets so every occurrence of a window co-locates. ``doc`` is the
+        global row id (row_offset + local index); ``pos`` the window start."""
+        import pyarrow as pa
+        from jude import curate as _c
+
+        t = _realign(table)
+        texts = t.column(column).to_pylist()
+        hh: list[list[int]] = [[] for _ in range(num_buckets)]
+        dd: list[list[int]] = [[] for _ in range(num_buckets)]
+        pp: list[list[int]] = [[] for _ in range(num_buckets)]
+        for i, txt in enumerate(texts):
+            doc = row_offset + i
+            for pos, h in enumerate(_c.window_hashes((txt or "").split(), k)):
+                bkt = h % num_buckets
+                hh[bkt].append(h)
+                dd[bkt].append(doc)
+                pp[bkt].append(pos)
+        out = []
+        for bkt in range(num_buckets):
+            out.append(pa.table({"_h": pa.array(hh[bkt], type=pa.uint64()),
+                                 "_doc": pa.array(dd[bkt], type=pa.int64()),
+                                 "_pos": pa.array(pp[bkt], type=pa.int64())}))
+        return out if num_buckets > 1 else out[0]
+
+    def curate_substring_dups_bucket(self, shard_refs: list) -> "pa.Table":
+        """Reducer for distributed exact-substring dedup: gather a bucket's
+        (h, doc, pos) window occurrences, group by hash, keep the globally
+        earliest occurrence — min (doc, pos) — as the survivor, and emit every
+        OTHER occurrence as a duplicate window-start (doc, pos) to remove.
+        min-(doc,pos) == single-node 'first occurrence in corpus order wins', so
+        the distributed result matches exactly."""
+        import pyarrow as pa
+
+        shards = [t for t in ray.get(shard_refs) if t is not None and t.num_rows > 0]
+        empty = pa.table({"_doc": pa.array([], type=pa.int64()),
+                          "_pos": pa.array([], type=pa.int64())})
+        if not shards:
+            return empty
+        merged = _realign(pa.concat_tables(shards))
+        hs = merged.column("_h").to_pylist()
+        docs = merged.column("_doc").to_pylist()
+        pos = merged.column("_pos").to_pylist()
+        by_hash: dict[int, list[tuple]] = {}
+        for h, d, p in zip(hs, docs, pos):
+            by_hash.setdefault(h, []).append((d, p))
+        out_doc: list[int] = []
+        out_pos: list[int] = []
+        for occs in by_hash.values():
+            if len(occs) < 2:
+                continue
+            keeper = min(occs)                       # earliest (doc, pos) survives
+            for d, p in occs:
+                if (d, p) != keeper:
+                    out_doc.append(d)
+                    out_pos.append(p)
+        if not out_doc:
+            return empty
+        return pa.table({"_doc": pa.array(out_doc, type=pa.int64()),
+                         "_pos": pa.array(out_pos, type=pa.int64())})
+
     def curate_fuzzy_edges_bucket(self, shard_refs: list, threshold: float) -> "pa.Table":
         """Reducer side of distributed fuzzy dedup: gather a bucket's
         (_rid, _bandkey, _sig) rows, group by exact band key (LSH candidates),

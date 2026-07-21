@@ -33,6 +33,7 @@ __all__ = [
     "dist_image_quality_filter",
     "dist_exact_dedup",
     "dist_fuzzy_dedup",
+    "dist_substring_dedup",
     "dist_global_shuffle",
     "dist_blend_datasets",
 ]
@@ -259,6 +260,80 @@ def dist_fuzzy_dedup(
     if len(keep) == n:
         return table
     return table.take(pa.array(keep, type=pa.int64())).combine_chunks()
+
+
+def dist_substring_dedup(
+    table: pa.Table, *, column: str = "text", out_column: str | None = None,
+    k: int = 50, runner: Any = None,
+) -> pa.Table:
+    """Distributed exact-substring dedup (L2.2), recall-matched to single-node.
+
+    Each shard emits the k-token window hashes of its docs as (hash, doc, pos)
+    and routes them to buckets by hash — so every occurrence of a window
+    co-locates (never materialized whole on the driver). Each reducer keeps the
+    globally-earliest occurrence per hash (min doc,pos) and reports the others as
+    duplicate window-starts; the driver removes the tokens those windows cover
+    from each doc and rejoins. min-(doc,pos) is exactly the single-node
+    'first-occurrence-in-corpus-order wins' rule, so the result is identical to
+    ``curate.substring_dedup`` — only the O(total-tokens) window hashing + the
+    duplicate-finding shuffle are distributed."""
+    from jude.runners import _ray_shim as shim
+    import jude
+
+    dst = out_column or column
+    r = _runner(runner)
+    con = jude.connect()
+    parts = r._partition_tables(con.from_arrow(table))
+    workers = r._ensure_workers()
+    b = r.mgr.shuffle_bucket_count(None)
+    bucket_workers = r.mgr.shuffle_bucket_workers(None)
+    offsets: list[int] = []
+    acc = 0
+    for part in parts:
+        offsets.append(acc)
+        acc += part.num_rows
+    refs = [
+        workers[r.mgr.worker_for(i)].curate_substring_windows.options(num_returns=b).remote(
+            part, column, k, b, offsets[i]
+        )
+        for i, part in enumerate(parts)
+    ]
+    refs = [x if isinstance(x, list) else [x] for x in refs]
+    dup_refs = [
+        workers[bucket_workers[bkt]].curate_substring_dups_bucket.remote(
+            [refs[p][bkt] for p in range(len(parts))]
+        )
+        for bkt in range(b)
+    ]
+    # collect duplicate window-starts grouped by doc (only duplicated regions —
+    # small for a mostly-unique corpus).
+    dup_pos: dict[int, list[int]] = {}
+    for dt in shim.get(dup_refs):
+        if dt is None or dt.num_rows == 0:
+            continue
+        for d, p in zip(dt.column("_doc").to_pylist(), dt.column("_pos").to_pylist()):
+            dup_pos.setdefault(d, []).append(p)
+    if not dup_pos:
+        return table
+    # apply: drop tokens covered by any duplicate window, per doc, and rejoin.
+    texts = table.column(column).to_pylist()
+    out_texts: list = []
+    for i, txt in enumerate(texts):
+        starts = dup_pos.get(i)
+        if not txt or not starts:
+            out_texts.append(txt)
+            continue
+        toks = txt.split()
+        n = len(toks)
+        drop = [False] * n
+        for s in starts:
+            for j in range(s, min(s + k, n)):
+                drop[j] = True
+        out_texts.append(" ".join(toks[j] for j in range(n) if not drop[j]))
+    arr = pa.array(out_texts, type=pa.string())
+    if dst in table.column_names:
+        return table.set_column(table.column_names.index(dst), dst, arr).combine_chunks()
+    return table.append_column(dst, arr).combine_chunks()
 
 
 # --- C9. distributed global shuffle + blend ---------------------------------
