@@ -171,7 +171,7 @@ def dist_exact_dedup(
 def dist_fuzzy_dedup(
     table: pa.Table, *, column: str = "text", threshold: float = 0.7,
     num_hashes: int = 128, ngram: int = 2, bands: int | None = None, seed: int = 1,
-    keep_cluster: bool = False, runner: Any = None,
+    keep_cluster: bool = False, cc_workers: int = 0, runner: Any = None,
 ) -> pa.Table:
     """Distributed MinHash-LSH fuzzy dedup, recall-matched to single-node.
 
@@ -219,11 +219,28 @@ def dist_fuzzy_dedup(
         for bkt in range(b)
     ]
     n = table.num_rows
-    # L2.1: stream each bucket's edges into an incremental union-find instead of
-    # collecting EVERY edge on the driver then running one CC pass. Peak driver
-    # memory is the label array (n) + one bucket's edges at a time, not the whole
-    # edge set — so a high-dup corpus with a huge edge count doesn't blow the
-    # driver. union-by-min keeps the lowest row index as each cluster's
+    if cc_workers and cc_workers > 0:
+        # L2.1 (trillion-scale): distribute the LABEL ARRAY too — label
+        # propagation across cc_workers actors, so the driver never holds n
+        # labels, only the sparse {rid -> smaller-rep} map for merged rows. Edges
+        # stay as refs (not materialized on the driver).
+        from jude.dist_cc import connected_components
+
+        label = connected_components(edge_refs, num_workers=cc_workers)
+        if keep_cluster:
+            reps = [label.get(i, i) for i in range(n)]
+            return table.append_column("dup_cluster", pa.array(reps, type=pa.int64())).combine_chunks()
+        # a rid survives iff it is a representative: absent from `label` (singleton
+        # or component-min) OR maps to itself.
+        keep = [i for i in range(n) if label.get(i, i) == i]
+        if len(keep) == n:
+            return table
+        return table.take(pa.array(keep, type=pa.int64())).combine_chunks()
+    # L2.1 (default): stream each bucket's edges into an incremental union-find
+    # instead of collecting EVERY edge on the driver then running one CC pass.
+    # Peak driver memory is the label array (n) + one bucket's edges at a time,
+    # not the whole edge set — so a high-dup corpus with a huge edge count doesn't
+    # blow the driver. union-by-min keeps the lowest row index as each cluster's
     # representative (matches single-node fuzzy_dedup's keep-lowest semantics).
     uf = _UnionFind(n)
     for ref in edge_refs:
