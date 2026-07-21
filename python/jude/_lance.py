@@ -83,10 +83,15 @@ def read_table(path: str, columns: Any = None, filter: Any = None, version: Any 
     return ds.to_table(columns=columns, filter=filter)
 
 
-def write(table: pa.Table, path: str, mode: str = "create") -> dict:
+def write(table: pa.Table, path: str, mode: str = "create", storage_options: dict | None = None) -> dict:
     # mode: create | append | overwrite  (Lance's own write_dataset modes)
     m = {"create": "create", "append": "append", "overwrite": "overwrite"}.get(mode, "create")
-    lance.write_dataset(table, path, mode=m)
+    # Lance writes to object stores (s3://, gs://) via its OWN storage_options
+    # (object_store crate, not fsspec) — e.g. for MinIO:
+    # {"endpoint": "http://localhost:9000", "access_key_id": ..,
+    #  "secret_access_key": .., "allow_http": "true"}.
+    kw = {"storage_options": storage_options} if storage_options else {}
+    lance.write_dataset(table, path, mode=m, **kw)
     invalidate(path)  # new snapshot — drop stale handle + bump epoch
     return {"path": path, "rows": table.num_rows}
 
